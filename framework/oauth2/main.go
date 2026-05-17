@@ -3,6 +3,7 @@ package oauth2
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -591,6 +592,57 @@ func (p *OAuth2Provider) CompleteOAuthFlow(ctx context.Context, state, code stri
 	return nil
 }
 
+// BuildUpstreamAuthorizeURL reconstructs the upstream provider authorization
+// URL for a pending per-user OAuth flow. Called by the frontend sessions tab
+// when the user clicks "Authenticate" — at which point the flow row already
+// exists (from a prior InitiateUserOAuthFlow), the CSRF state + PKCE verifier
+// are stored on it, and we just need to hand the user the upstream redirect.
+//
+// The code_challenge is recomputed deterministically from the stored verifier
+// so we don't have to persist it separately.
+func (p *OAuth2Provider) BuildUpstreamAuthorizeURL(ctx context.Context, flowID string) (string, error) {
+	flow, err := p.configStore.GetOauthUserSessionByID(ctx, flowID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load pending oauth flow: %w", err)
+	}
+	if flow == nil {
+		return "", schemas.ErrOAuth2NotPerUserSession
+	}
+	if flow.Status != "pending" {
+		return "", fmt.Errorf("oauth flow %s is %s, not pending", flowID, flow.Status)
+	}
+	if time.Now().After(flow.ExpiresAt) {
+		return "", fmt.Errorf("oauth flow %s has expired", flowID)
+	}
+	templateConfig, err := p.configStore.GetOauthConfigByID(ctx, flow.OauthConfigID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load template oauth config: %w", err)
+	}
+	if templateConfig == nil {
+		return "", schemas.ErrOAuth2ConfigNotFound
+	}
+	// Recompute the PKCE challenge from the stored verifier (deterministic).
+	hash := sha256.Sum256([]byte(flow.CodeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(hash[:])
+
+	var scopes []string
+	if templateConfig.Scopes != "" {
+		_ = json.Unmarshal([]byte(templateConfig.Scopes), &scopes)
+	}
+	redirectURI := flow.RedirectURI
+	if redirectURI == "" {
+		redirectURI = templateConfig.RedirectURI
+	}
+	return p.buildAuthorizeURLWithPKCE(
+		templateConfig.AuthorizeURL,
+		templateConfig.GetResolvedClientID(),
+		redirectURI,
+		flow.State,
+		codeChallenge,
+		scopes,
+	), nil
+}
+
 // buildAuthorizeURLWithPKCE constructs the OAuth authorization URL with PKCE parameters
 func (p *OAuth2Provider) buildAuthorizeURLWithPKCE(authorizeURL, clientID, redirectURI, state, codeChallenge string, scopes []string) string {
 	params := url.Values{}
@@ -816,8 +868,9 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 		return nil, "", fmt.Errorf("failed to generate state token: %w", err)
 	}
 
-	// Generate PKCE challenge
-	codeVerifier, codeChallenge, err := GeneratePKCEChallenge()
+	// Generate PKCE code verifier; the challenge is derived from it on demand
+	// by the /flows/:id/start endpoint, so we don't need to keep it here.
+	codeVerifier, _, err := GeneratePKCEChallenge()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate PKCE challenge: %w", err)
 	}
@@ -915,21 +968,22 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 		}
 	}
 
-	// Build authorize URL with PKCE
-	authURL := p.buildAuthorizeURLWithPKCE(
-		templateConfig.AuthorizeURL,
-		templateConfig.GetResolvedClientID(),
-		redirectURI,
-		state,
-		codeChallenge,
-		scopes,
-	)
+	// Frontend URL the user (or their teammate) opens in a browser. The
+	// upstream provider URL is reconstructed on demand by the /flows/:id/start
+	// endpoint using the stored CSRF state + PKCE verifier — we don't pin it
+	// here so the row stays the single source of truth for those fields.
+	//
+	// Derive the Bifrost base URL from the OAuth callback redirect URI passed
+	// in by the caller — it always has the shape "{base}/api/oauth/callback".
+	// Flow ID rides as a query param to match the flat-route convention used
+	// elsewhere in the dashboard UI.
+	frontendURL := strings.TrimSuffix(redirectURI, "/api/oauth/callback") + "/workspace/mcp-sessions/auth?flow=" + sessionID
 
 	logger.Debug("Per-user OAuth flow initiated: session_id=%s, mcp_client_id=%s", sessionID, mcpClientID)
 
 	return &schemas.OAuth2FlowInitiation{
 		OauthConfigID: oauthConfigID,
-		AuthorizeURL:  authURL,
+		AuthorizeURL:  frontendURL,
 		State:         state,
 		ExpiresAt:     expiresAt,
 	}, sessionID, nil

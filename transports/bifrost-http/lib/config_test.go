@@ -1246,6 +1246,18 @@ func (m *MockConfigStore) GetActiveOauthUserTokensByUser(ctx context.Context, us
 	return nil, nil
 }
 
+func (m *MockConfigStore) GetOauthUserTokenByID(ctx context.Context, id string) (*tables.TableOauthUserToken, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) ListOauthUserTokensByMode(ctx context.Context, mode schemas.AuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error) {
+	return nil, nil
+}
+
 func (m *MockConfigStore) DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error) {
 	return 0, nil
 }

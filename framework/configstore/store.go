@@ -344,6 +344,18 @@ type ConfigStore interface {
 	// for the given user (status='active', user_id=userID). Used by callers
 	// computing user-aware cascade decisions and by the sessions UI.
 	GetActiveOauthUserTokensByUser(ctx context.Context, userID string) ([]tables.TableOauthUserToken, error)
+	// GetOauthUserTokenByID looks up a single token row by primary key.
+	// Returns nil, nil when not found.
+	GetOauthUserTokenByID(ctx context.Context, id string) (*tables.TableOauthUserToken, error)
+	// ListOauthUserTokensByMode returns token rows keyed by the given mode's
+	// identity column. When includeOrphaned is true, status='orphaned' rows are
+	// returned alongside status='active'; otherwise only active rows. For
+	// AuthModeNone the identity is the raw (unhashed) session token.
+	ListOauthUserTokensByMode(ctx context.Context, mode schemas.AuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error)
+	// ListOauthUserSessionsByMode returns pending OAuth flow rows keyed by the
+	// given mode's identity column (status='pending', expires_at > NOW()). For
+	// AuthModeNone the identity is the raw (unhashed) session token.
+	ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error)
 	// DeleteExpiredOauthUserSessions hard-deletes pending OAuth flow rows
 	// whose ExpiresAt has passed. Returns the number of rows removed.
 	DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error)

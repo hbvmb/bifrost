@@ -4871,6 +4871,75 @@ func (s *RDBConfigStore) OrphanOauthUserTokensForUser(ctx context.Context, userI
 	return nil
 }
 
+// GetOauthUserTokenByID looks up a single token row by primary key. Returns
+// nil, nil when not found.
+func (s *RDBConfigStore) GetOauthUserTokenByID(ctx context.Context, id string) (*tables.TableOauthUserToken, error) {
+	if id == "" {
+		return nil, nil
+	}
+	var token tables.TableOauthUserToken
+	if err := s.DB().WithContext(ctx).Where("id = ?", id).First(&token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get oauth user token by id %s: %w", id, err)
+	}
+	return &token, nil
+}
+
+// ListOauthUserTokensByMode returns token rows keyed by the given mode's
+// identity column. Used by the sessions tab to show what the caller can see.
+func (s *RDBConfigStore) ListOauthUserTokensByMode(ctx context.Context, mode schemas.AuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error) {
+	if identity == "" {
+		return nil, nil
+	}
+	statuses := []string{"active"}
+	if includeOrphaned {
+		statuses = append(statuses, "orphaned")
+	}
+	var tokens []tables.TableOauthUserToken
+	q := s.DB().WithContext(ctx).Where("status IN ?", statuses)
+	switch mode {
+	case schemas.AuthModeUser:
+		q = q.Where("user_id = ?", identity)
+	case schemas.AuthModeVK:
+		q = q.Where("virtual_key_id = ?", identity)
+	case schemas.AuthModeNone:
+		q = q.Where("session_token_hash = ?", encrypt.HashSHA256(identity))
+	default:
+		return nil, fmt.Errorf("unknown auth mode: %s", mode)
+	}
+	if err := q.Order("created_at DESC").Find(&tokens).Error; err != nil {
+		return nil, fmt.Errorf("failed to list oauth user tokens (mode=%s): %w", mode, err)
+	}
+	return tokens, nil
+}
+
+// ListOauthUserSessionsByMode returns pending OAuth flow rows keyed by the
+// given mode's identity column. Excludes expired rows (the sweep worker
+// removes them but a fresh expiry between sweep ticks shouldn't surface).
+func (s *RDBConfigStore) ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error) {
+	if identity == "" {
+		return nil, nil
+	}
+	var sessions []tables.TableOauthUserSession
+	q := s.DB().WithContext(ctx).Where("status = ? AND expires_at > ?", "pending", time.Now())
+	switch mode {
+	case schemas.AuthModeUser:
+		q = q.Where("user_id = ?", identity)
+	case schemas.AuthModeVK:
+		q = q.Where("virtual_key_id = ?", identity)
+	case schemas.AuthModeNone:
+		q = q.Where("session_token_hash = ?", encrypt.HashSHA256(identity))
+	default:
+		return nil, fmt.Errorf("unknown auth mode: %s", mode)
+	}
+	if err := q.Order("created_at DESC").Find(&sessions).Error; err != nil {
+		return nil, fmt.Errorf("failed to list pending oauth user sessions (mode=%s): %w", mode, err)
+	}
+	return sessions, nil
+}
+
 // GetActiveOauthUserTokensByUser returns all active user-keyed token rows for
 // the given user. Used by user-aware cascade callers and the sessions UI.
 func (s *RDBConfigStore) GetActiveOauthUserTokensByUser(ctx context.Context, userID string) ([]tables.TableOauthUserToken, error) {
