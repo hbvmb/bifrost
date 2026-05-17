@@ -4,12 +4,9 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"net/url"
-	"strings"
 
 	"github.com/fasthttp/router"
 	bifrost "github.com/maximhq/bifrost/core"
@@ -42,7 +39,18 @@ func (h *OAuthHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.B
 	r.DELETE("/api/oauth/config/{id}", lib.ChainMiddlewares(h.revokeOAuthConfig, middlewares...))
 }
 
-// handleOAuthCallback handles the OAuth provider callback
+// handleOAuthCallback handles the upstream OAuth provider callback. Performs
+// the token exchange server-side (needs client_secret) and then redirects the
+// browser into the dashboard, which shows the user-facing success/error UX.
+//
+// Two flow types share this redirect_uri, distinguished by which state table
+// the state token belongs to:
+//   - Per-user runtime flow (Bifrost-as-client to upstream for an MCP server's
+//     per-user OAuth). On success → /workspace/mcp-sessions.
+//   - Server-level admin-test flow (mcpClientSheet OAuth2Authorizer popup
+//     validating an OAuth config template). On success → /workspace/mcp-sessions/oauth-callback
+//     which posts a message to the opener window and closes itself.
+//
 // GET /api/oauth/callback?state=xxx&code=yyy&error=zzz
 func (h *OAuthHandler) handleOAuthCallback(ctx *fasthttp.RequestCtx) {
 	state := string(ctx.QueryArgs().Peek("state"))
@@ -50,70 +58,41 @@ func (h *OAuthHandler) handleOAuthCallback(ctx *fasthttp.RequestCtx) {
 	errorParam := string(ctx.QueryArgs().Peek("error"))
 	errorDescription := string(ctx.QueryArgs().Peek("error_description"))
 
-	// Handle authorization denial
 	if errorParam != "" {
 		h.handleCallbackError(ctx, state, errorParam, errorDescription)
 		return
 	}
 
-	// Validate required parameters
 	if state == "" || code == "" {
 		SendError(ctx, fasthttp.StatusBadRequest, "Missing required parameters: state and code")
 		return
 	}
 
-	// Try per-user OAuth runtime flow first (state from oauth_user_sessions table).
-	// This handles the case where an end-user authenticates during inference.
-	sessionToken, perUserErr := h.oauthProvider.CompleteUserOAuthFlow(context.Background(), state, code)
+	// Per-user runtime flow (state lives in oauth_user_sessions).
+	_, perUserErr := h.oauthProvider.CompleteUserOAuthFlow(context.Background(), state, code)
 	if perUserErr != nil && !errors.Is(perUserErr, schemas.ErrOAuth2NotPerUserSession) {
-		// Real per-user error (not "state not found") — don't fall through to admin flow
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Per-user OAuth flow failed: %v", perUserErr))
+		ctx.Redirect("/workspace/mcp-sessions?error="+url.QueryEscape(perUserErr.Error()), fasthttp.StatusFound)
 		return
 	}
-	if perUserErr == nil && sessionToken != "" {
-		// Consent flow: session token is a flow proxy ("flow:<flowID>:<mcpClientID>").
-		// Redirect back to the MCPs consent page so the user can continue.
-		if strings.HasPrefix(sessionToken, "flow:") {
-			rest := strings.TrimPrefix(sessionToken, "flow:")
-			flowID := strings.SplitN(rest, ":", 2)[0]
-			mcpsURL := fmt.Sprintf("/oauth/consent/mcps?flow_id=%s", url.QueryEscape(flowID))
-			ctx.Redirect(mcpsURL, fasthttp.StatusFound)
-			return
-		}
-
-		// Per-user runtime OAuth flow completed — show success page.
-		ctx.SetStatusCode(fasthttp.StatusOK)
-		ctx.SetContentType("text/html")
-		ctx.SetBodyString(oauthSuccessPage(`
-				if (window.opener) {
-					window.opener.postMessage({ type: 'oauth_success' }, window.location.origin);
-					window.close();
-				}
-		`, "Authorization Successful", "You can close this tab."))
+	if perUserErr == nil {
+		ctx.Redirect("/workspace/mcp-sessions?completed=1", fasthttp.StatusFound)
 		return
 	}
 
-	// Fall through to standard OAuth flow (handles both admin test logins for
-	// per_user_oauth setup and regular server-level OAuth).
+	// Fall through: server-level admin-test flow.
 	if err := h.oauthProvider.CompleteOAuthFlow(context.Background(), state, code); err != nil {
-		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("OAuth flow completion failed: %v", err))
+		ctx.Redirect("/workspace/mcp-sessions/oauth-callback?status=failed&error="+url.QueryEscape(err.Error()), fasthttp.StatusFound)
 		return
 	}
-
-	// Redirect to success page (or close popup)
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetContentType("text/html")
-	ctx.SetBodyString(oauthSuccessPage(`
-		if (window.opener) {
-			window.opener.postMessage({ type: 'oauth_success' }, window.location.origin);
-			window.close();
-		}
-	`, "Authorization Successful", "OAuth authorization successful! You can close this window."))
+	ctx.Redirect("/workspace/mcp-sessions/oauth-callback?status=success", fasthttp.StatusFound)
 }
 
-// handleCallbackError handles OAuth callback errors
+// handleCallbackError handles ?error= responses from upstream providers.
+// Marks the OAuth config row as failed (for admin UI's pending-setup display),
+// then redirects to the dashboard. We don't know which flow type the state
+// belongs to without a DB lookup, so we redirect to the admin-side callback
+// route which falls back to the sessions tab if there's no opener window.
 func (h *OAuthHandler) handleCallbackError(ctx *fasthttp.RequestCtx, state, errorParam, errorDescription string) {
-	// Update OAuth config status to failed if state is provided
 	if state != "" {
 		oauthConfig, err := h.store.ConfigStore.GetOauthConfigByState(context.Background(), state)
 		if err == nil && oauthConfig != nil {
@@ -121,19 +100,11 @@ func (h *OAuthHandler) handleCallbackError(ctx *fasthttp.RequestCtx, state, erro
 			h.store.ConfigStore.UpdateOauthConfig(context.Background(), oauthConfig)
 		}
 	}
-
-	// Show error page
-	ctx.SetStatusCode(fasthttp.StatusBadRequest)
-	ctx.SetContentType("text/html")
 	errorMsg := errorParam
 	if errorDescription != "" {
 		errorMsg = fmt.Sprintf("%s: %s", errorParam, errorDescription)
 	}
-	// JSON-encode for safe embedding in JavaScript context (prevents JS injection)
-	jsEscaped, _ := json.Marshal(errorMsg)
-	// HTML-escape for safe embedding in HTML body (prevents HTML injection)
-	htmlEscaped := html.EscapeString(errorMsg)
-	ctx.SetBodyString(oauthErrorPage(string(jsEscaped), htmlEscaped))
+	ctx.Redirect("/workspace/mcp-sessions/oauth-callback?status=failed&error="+url.QueryEscape(errorMsg), fasthttp.StatusFound)
 }
 
 // getOAuthConfigStatus returns the current status of an OAuth config
@@ -264,69 +235,6 @@ func (h *OAuthHandler) GetAccessToken(ctx context.Context, oauthConfigID string)
 	return h.oauthProvider.GetAccessToken(ctx, oauthConfigID)
 }
 
-// oauthSuccessPage renders a Bifrost-themed success HTML page.
-// extraScript is injected verbatim into a <script> tag (caller is responsible for safety).
-func oauthSuccessPage(extraScript, title, message string) string {
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>%s</title>
-<style>%s
-  .icon{font-size:2.5rem;margin-bottom:16px}
-  .msg{font-size:0.9rem;color:oklch(0.552 0.016 285.938);margin-top:8px}
-</style>
-<script>%s</script>
-</head>
-<body>
-<div class="card" style="text-align:center">
-  <div class="icon">&#10003;</div>
-  <h1>%s</h1>
-  <p class="msg">%s</p>
-</div>
-</body>
-</html>`, html.EscapeString(title), bifrostPageCSS, extraScript, html.EscapeString(title), html.EscapeString(message))
-}
-
-// oauthErrorPage renders a Bifrost-themed error HTML page.
-// jsEscapedError must already be JSON-encoded (with quotes) for safe JS embedding.
-// htmlError must already be HTML-escaped for safe body embedding.
-func oauthErrorPage(jsEscapedError, htmlError string) string {
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Authorization Failed</title>
-<style>%s
-  .icon{font-size:2.5rem;margin-bottom:16px;color:oklch(0.50 0.18 27)}
-  .err-msg{font-size:0.9rem;color:oklch(0.552 0.016 285.938);margin-top:8px}
-  .hint{font-size:0.8rem;color:oklch(0.65 0.01 286);margin-top:16px}
-</style>
-<script>
-  if (window.opener) {
-    window.opener.postMessage({ type: 'oauth_failed', error: %s }, window.location.origin);
-    window.close();
-  }
-</script>
-</head>
-<body>
-<div class="card" style="text-align:center">
-  <div class="icon">&#10007;</div>
-  <h1>Authorization Failed</h1>
-  <p class="err-msg">%s</p>
-  <p class="hint">You can close this window.</p>
-</div>
-</body>
-</html>`, bifrostPageCSS, jsEscapedError, htmlError)
-}
-
-// jsEscapeString returns a JSON-encoded string (with quotes) safe for embedding in JavaScript.
-func jsEscapeString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
 
 // RevokeToken revokes the OAuth token for a given oauth_config_id.
 // Used during per-user OAuth setup to discard the admin's temporary token after verification.

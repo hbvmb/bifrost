@@ -321,7 +321,7 @@ func (bc *BifrostContext) AuthMode() AuthMode {
 	if vkID, ok := bc.Value(BifrostContextKeyGovernanceVirtualKeyID).(string); ok && vkID != "" {
 		return AuthModeVK
 	}
-	return AuthModeNone
+	return AuthModeSession
 }
 
 // SetValue sets a value in the internal userValues map.

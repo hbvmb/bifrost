@@ -319,6 +319,15 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 				return true
 			}
 		}
+		// Handle MCP session ID header (x-bf-mcp-session-id): a client-issued
+		// opaque identifier used for session-mode per-user OAuth flows. Any
+		// non-empty string the caller can re-present on subsequent /mcp calls.
+		if keyStr == "x-bf-mcp-session-id" {
+			if v := strings.TrimSpace(string(value)); v != "" {
+				bifrostCtx.SetValue(schemas.BifrostContextKeyMCPSessionID, v)
+			}
+			return true
+		}
 		// Handle virtual key header (x-bf-vk, authorization, x-api-key, x-goog-api-key headers)
 		if keyStr == string(schemas.BifrostContextKeyVirtualKey) {
 			bifrostCtx.SetValue(schemas.BifrostContextKeyVirtualKey, string(value))

@@ -743,6 +743,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddOAuthAuthModeColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationReplaceOauthSessionTokenWithSessionID(ctx, db); err != nil {
+		return err
+	}
 	if err := migrationAddTeamCalendarAlignedColumn(ctx, db); err != nil {
 		return err
 	}
@@ -7734,6 +7737,127 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 			}
 			if mg.HasTable(&tables.TablePerUserOAuthSession{}) && mg.HasColumn(&tables.TablePerUserOAuthSession{}, "auth_mode") {
 				_ = mg.DropColumn(&tables.TablePerUserOAuthSession{}, "AuthMode")
+			}
+
+			return nil
+		},
+	})
+}
+
+// migrationReplaceOauthSessionTokenWithSessionID switches both
+// oauth_user_sessions and oauth_user_tokens from the legacy SessionToken +
+// SessionTokenHash pair (server-issued bearer credential, SHA-256 hashed for
+// the lookup column) to a single plaintext SessionID column.
+//
+// Why the change: session-mode identity is now caller-asserted via the
+// x-bf-mcp-session-id header (same trust model as a VK value). It's no longer
+// a Bifrost-issued bearer token, so hashing buys nothing and the unique index
+// on session_token_hash was conflating "uniqueness of token value" with
+// "uniqueness of binding" — the latter is now enforced at the application
+// layer by the (mode, identity, mcp_client_id) lookup in
+// InitiateUserOAuthFlow and CreateOauthUserToken.
+//
+// Order: add SessionID first, then drop the legacy columns + their indexes.
+// No data backfill: existing rows are dev-only test data; production hasn't
+// landed yet.
+func migrationReplaceOauthSessionTokenWithSessionID(ctx context.Context, db *gorm.DB) error {
+	return RunSingleMigration(ctx, db, &migrator.Migration{
+		ID: "replace_oauth_session_token_with_session_id",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+
+			// 1) oauth_user_sessions: add session_id, drop legacy columns + index.
+			if mg.HasTable(&tables.TableOauthUserSession{}) {
+				if !mg.HasColumn(&tables.TableOauthUserSession{}, "session_id") {
+					if err := mg.AddColumn(&tables.TableOauthUserSession{}, "SessionID"); err != nil {
+						return fmt.Errorf("add session_id to oauth_user_sessions: %w", err)
+					}
+				}
+				// The legacy session_token_hash column had a uniqueIndex declared
+				// via gorm tag; GORM names it something like
+				// "idx_oauth_user_sessions_session_token_hash". DROP COLUMN drops
+				// the dependent index on Postgres/SQLite, but be explicit on
+				// Postgres for safety.
+				if err := tx.Exec("DROP INDEX IF EXISTS idx_oauth_user_sessions_session_token_hash").Error; err != nil {
+					return fmt.Errorf("drop legacy session_token_hash index on oauth_user_sessions: %w", err)
+				}
+				if mg.HasColumn(&tables.TableOauthUserSession{}, "session_token_hash") {
+					if err := mg.DropColumn(&tables.TableOauthUserSession{}, "session_token_hash"); err != nil {
+						return fmt.Errorf("drop session_token_hash from oauth_user_sessions: %w", err)
+					}
+				}
+				if mg.HasColumn(&tables.TableOauthUserSession{}, "session_token") {
+					if err := mg.DropColumn(&tables.TableOauthUserSession{}, "session_token"); err != nil {
+						return fmt.Errorf("drop session_token from oauth_user_sessions: %w", err)
+					}
+				}
+			}
+
+			// 2) oauth_user_tokens: same dance plus drop the partial unique index
+			// idx_oauth_user_tokens_session_mcp created by the prior migration —
+			// its key column (session_token_hash) is being removed.
+			if mg.HasTable(&tables.TableOauthUserToken{}) {
+				if !mg.HasColumn(&tables.TableOauthUserToken{}, "session_id") {
+					if err := mg.AddColumn(&tables.TableOauthUserToken{}, "SessionID"); err != nil {
+						return fmt.Errorf("add session_id to oauth_user_tokens: %w", err)
+					}
+				}
+				if err := tx.Exec("DROP INDEX IF EXISTS idx_oauth_user_tokens_session_mcp").Error; err != nil {
+					return fmt.Errorf("drop legacy idx_oauth_user_tokens_session_mcp: %w", err)
+				}
+				if err := tx.Exec("DROP INDEX IF EXISTS idx_oauth_user_tokens_session_token_hash").Error; err != nil {
+					return fmt.Errorf("drop legacy session_token_hash index on oauth_user_tokens: %w", err)
+				}
+				if mg.HasColumn(&tables.TableOauthUserToken{}, "session_token_hash") {
+					if err := mg.DropColumn(&tables.TableOauthUserToken{}, "session_token_hash"); err != nil {
+						return fmt.Errorf("drop session_token_hash from oauth_user_tokens: %w", err)
+					}
+				}
+				if mg.HasColumn(&tables.TableOauthUserToken{}, "session_token") {
+					if err := mg.DropColumn(&tables.TableOauthUserToken{}, "session_token"); err != nil {
+						return fmt.Errorf("drop session_token from oauth_user_tokens: %w", err)
+					}
+				}
+
+				// Replace the partial unique index with one keyed on the new column.
+				if err := tx.Exec(`
+					CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_session_mcp
+						ON oauth_user_tokens (session_id, mcp_client_id)
+						WHERE session_id IS NOT NULL AND session_id != ''
+				`).Error; err != nil {
+					return fmt.Errorf("create idx_oauth_user_tokens_session_mcp on session_id: %w", err)
+				}
+			}
+
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+
+			// Drop the new partial unique index keyed on session_id.
+			if err := tx.Exec("DROP INDEX IF EXISTS idx_oauth_user_tokens_session_mcp").Error; err != nil {
+				return fmt.Errorf("drop idx_oauth_user_tokens_session_mcp: %w", err)
+			}
+
+			// Re-add legacy columns via raw DDL. The typed struct fields no
+			// longer exist, so we can't use mg.AddColumn. Best-effort
+			// schema-only rollback; original session tokens are gone, so
+			// callers depending on this data would need their own recovery.
+			for _, tableName := range []string{"oauth_user_sessions", "oauth_user_tokens"} {
+				if err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN session_token VARCHAR(255)", tableName)).Error; err != nil {
+					// Ignore "column already exists" / dialect quirks.
+					_ = err
+				}
+				if err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN session_token_hash VARCHAR(64)", tableName)).Error; err != nil {
+					_ = err
+				}
+			}
+			for _, model := range []interface{}{&tables.TableOauthUserSession{}, &tables.TableOauthUserToken{}} {
+				if mg.HasTable(model) && mg.HasColumn(model, "session_id") {
+					_ = mg.DropColumn(model, "SessionID")
+				}
 			}
 
 			return nil

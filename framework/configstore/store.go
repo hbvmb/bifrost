@@ -314,7 +314,12 @@ type ConfigStore interface {
 	GetOauthUserSessionByID(ctx context.Context, id string) (*tables.TableOauthUserSession, error)
 	GetOauthUserSessionByState(ctx context.Context, state string) (*tables.TableOauthUserSession, error)
 	ClaimOauthUserSessionByState(ctx context.Context, state string) (*tables.TableOauthUserSession, error)
-	GetOauthUserSessionBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserSession, error)
+	GetOauthUserSessionBySessionID(ctx context.Context, sessionID string) (*tables.TableOauthUserSession, error)
+	// GetOauthUserSessionByModeIdentityAndMCPClient returns the canonical flow
+	// row for an (identity, mcp_client) binding. Used at flow-init time as the
+	// single source of truth: reauth updates this row in place rather than
+	// inserting a new one. Returns (nil, nil) when no row exists.
+	GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserSession, error)
 	CreateOauthUserSession(ctx context.Context, session *tables.TableOauthUserSession) error
 	UpdateOauthUserSession(ctx context.Context, session *tables.TableOauthUserSession) error
 
@@ -323,12 +328,16 @@ type ConfigStore interface {
 	// GetOauthUserTokenByMode looks up the active token row keyed by a single
 	// identity dimension. Filters status='active'. identity is the user ID for
 	// AuthModeUser, the VK row ID for AuthModeVK, and the raw (unhashed)
-	// session token for AuthModeNone — the store hashes for the lookup.
+	// session token for AuthModeSession — the store hashes for the lookup.
 	GetOauthUserTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error)
-	GetOauthUserTokenBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserToken, error)
+	GetOauthUserTokenBySessionID(ctx context.Context, sessionID string) (*tables.TableOauthUserToken, error)
 	CreateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
 	UpdateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
 	DeleteOauthUserToken(ctx context.Context, id string) error
+	// DeleteOauthUserSessionsByModeIdentityAndMCPClient hard-deletes any flow
+	// rows matching the given identity column + MCP client. Used by revoke
+	// across all auth modes so subsequent OAuth init starts from a clean slate.
+	DeleteOauthUserSessionsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) error
 	DeleteOauthUserTokensByMCPClient(ctx context.Context, mcpClientID string) error
 	// DeleteOauthUserTokensByVK hard-deletes vk-keyed rows for the given VK ID.
 	DeleteOauthUserTokensByVK(ctx context.Context, vkID string) error
@@ -350,12 +359,19 @@ type ConfigStore interface {
 	// ListOauthUserTokensByMode returns token rows keyed by the given mode's
 	// identity column. When includeOrphaned is true, status='orphaned' rows are
 	// returned alongside status='active'; otherwise only active rows. For
-	// AuthModeNone the identity is the raw (unhashed) session token.
+	// AuthModeSession the identity is the raw (unhashed) session token.
 	ListOauthUserTokensByMode(ctx context.Context, mode schemas.AuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error)
 	// ListOauthUserSessionsByMode returns pending OAuth flow rows keyed by the
 	// given mode's identity column (status='pending', expires_at > NOW()). For
-	// AuthModeNone the identity is the raw (unhashed) session token.
+	// AuthModeSession the identity is the raw (unhashed) session token.
 	ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error)
+	// ListAllOauthUserTokens returns all token rows (active + optionally
+	// orphaned). Used by the sessions tab when the caller has no identity
+	// scoping (admin view in OSS).
+	ListAllOauthUserTokens(ctx context.Context, includeOrphaned bool) ([]tables.TableOauthUserToken, error)
+	// ListAllPendingOauthUserSessions returns all pending OAuth flow rows.
+	// Companion to ListAllOauthUserTokens for the admin view.
+	ListAllPendingOauthUserSessions(ctx context.Context) ([]tables.TableOauthUserSession, error)
 	// DeleteExpiredOauthUserSessions hard-deletes pending OAuth flow rows
 	// whose ExpiresAt has passed. Returns the number of rows removed.
 	DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error)
@@ -388,14 +404,6 @@ type ConfigStore interface {
 	// and creates the authorization code in a single transaction. Returns (0, nil) if the
 	// flow was already consumed by a concurrent request.
 	FinalizePerUserOAuthConsent(ctx context.Context, flowID string, session *tables.TablePerUserOAuthSession, code *tables.TablePerUserOAuthCode) (int64, error)
-	// GetOauthUserTokensByGatewaySessionID returns all upstream tokens linked to a gateway session ID.
-	// Used during consent submit to discover which MCPs the user authenticated with.
-	// Queries tokens via upstream sessions matching the given gateway session ID.
-	GetOauthUserTokensByGatewaySessionID(ctx context.Context, gatewaySessionID string) ([]tables.TableOauthUserToken, error)
-	// TransferOauthUserTokensFromGatewaySession migrates upstream tokens from all flow proxy sessions
-	// (identified by gateway_session_id) to the real Bifrost session token, and sets VirtualKeyID/UserID on each record.
-	TransferOauthUserTokensFromGatewaySession(ctx context.Context, gatewaySessionID, realSessionToken, virtualKeyID, userID string) error
-
 	// Not found retry wrapper
 	RetryOnNotFound(ctx context.Context, fn func(ctx context.Context) (any, error), maxRetries int, retryDelay time.Duration) (any, error)
 

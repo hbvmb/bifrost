@@ -1185,7 +1185,11 @@ func (m *MockConfigStore) ClaimOauthUserSessionByState(ctx context.Context, stat
 	return nil, nil
 }
 
-func (m *MockConfigStore) GetOauthUserSessionBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserSession, error) {
+func (m *MockConfigStore) GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserSession, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) GetOauthUserSessionBySessionID(ctx context.Context, sessionID string) (*tables.TableOauthUserSession, error) {
 	return nil, nil
 }
 
@@ -1206,7 +1210,7 @@ func (m *MockConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode sche
 	return nil, nil
 }
 
-func (m *MockConfigStore) GetOauthUserTokenBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserToken, error) {
+func (m *MockConfigStore) GetOauthUserTokenBySessionID(ctx context.Context, sessionID string) (*tables.TableOauthUserToken, error) {
 	return nil, nil
 }
 
@@ -1219,6 +1223,10 @@ func (m *MockConfigStore) UpdateOauthUserToken(ctx context.Context, token *table
 }
 
 func (m *MockConfigStore) DeleteOauthUserToken(ctx context.Context, id string) error {
+	return nil
+}
+
+func (m *MockConfigStore) DeleteOauthUserSessionsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) error {
 	return nil
 }
 
@@ -1255,6 +1263,14 @@ func (m *MockConfigStore) ListOauthUserTokensByMode(ctx context.Context, mode sc
 }
 
 func (m *MockConfigStore) ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) ListAllOauthUserTokens(ctx context.Context, includeOrphaned bool) ([]tables.TableOauthUserToken, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) ListAllPendingOauthUserSessions(ctx context.Context) ([]tables.TableOauthUserSession, error) {
 	return nil, nil
 }
 
@@ -1329,14 +1345,6 @@ func (m *MockConfigStore) DeletePerUserOAuthPendingFlow(ctx context.Context, id 
 
 func (m *MockConfigStore) ConsumePerUserOAuthPendingFlow(ctx context.Context, id string) (int64, error) {
 	return 1, nil
-}
-
-func (m *MockConfigStore) GetOauthUserTokensByGatewaySessionID(ctx context.Context, gatewaySessionID string) ([]tables.TableOauthUserToken, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) TransferOauthUserTokensFromGatewaySession(ctx context.Context, gatewaySessionID, realSessionToken, virtualKeyID, userID string) error {
-	return nil
 }
 
 func (m *MockConfigStore) FinalizePerUserOAuthConsent(ctx context.Context, flowID string, session *tables.TablePerUserOAuthSession, code *tables.TablePerUserOAuthCode) (int64, error) {

@@ -83,6 +83,33 @@ export default function MCPSessionsAuthPage() {
 		);
 	}
 
+	// Flow row exists but isn't pending: it's already been completed, failed,
+	// or expired. Don't show the "Authenticate" button since startFlow would
+	// reject (BuildUpstreamAuthorizeURL rejects non-pending flows).
+	if (flow.status !== "pending") {
+		return (
+			<CenteredCard>
+				<h1 className="text-xl font-semibold">
+					{flow.status === "authorized"
+						? "Already authenticated"
+						: flow.status === "needs_reauth"
+							? "Re-authentication required"
+							: flow.status === "expired"
+								? "This authentication flow has expired"
+								: "This authentication flow can no longer be completed"}
+				</h1>
+				<p className="mt-2 text-sm text-muted-foreground">
+					{flow.status === "authorized"
+						? `The OAuth credential for ${flow.mcp_client?.name || flow.mcp_client?.client_id || "this MCP server"} is already stored. You can close this tab.`
+						: "Trigger the original action again so a fresh flow is created."}
+				</p>
+				<div className="mt-6">
+					<SessionsTabLink />
+				</div>
+			</CenteredCard>
+		);
+	}
+
 	const handleAuthenticate = async () => {
 		try {
 			const res = await startFlow(flowId).unwrap();
@@ -97,11 +124,11 @@ export default function MCPSessionsAuthPage() {
 			<div className="mb-4 flex size-12 items-center justify-center rounded-full bg-primary/10">
 				<ShieldCheck className="size-6 text-primary" />
 			</div>
-			<h1 className="text-xl font-semibold">Authenticate with {flow.mcp_client_id}</h1>
+			<h1 className="text-xl font-semibold">Authenticate with {flow.mcp_client?.name || flow.mcp_client?.client_id || "MCP server"}</h1>
 			<p className="mt-2 text-sm text-muted-foreground">
 				You'll be redirected to the provider to sign in and grant access. Bifrost will store the resulting credential against your{" "}
-				{flow.flow_mode === "user" ? "user identity" : flow.flow_mode === "vk" ? "virtual key" : "browser session"} so this request and
-				future ones can proceed automatically.
+				{flow.flow_mode === "user" ? "user identity" : flow.flow_mode === "vk" ? "virtual key" : "session ID"} so this request and future
+				ones can proceed automatically.
 			</p>
 			<div className="mt-6 flex gap-3">
 				<Button onClick={handleAuthenticate} disabled={starting}>

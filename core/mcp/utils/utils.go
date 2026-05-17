@@ -22,19 +22,13 @@ func ResolvePerUserOAuthToken(ctx *schemas.BifrostContext, client *schemas.MCPCl
 	identity := identityForMode(ctx, mode)
 
 	if identity == "" {
-		// AuthModeNone with no session token, or a mode whose identity column is
-		// somehow empty. Either way we can neither look up nor mint a flow that
-		// will be findable later.
-		isMCPGateway, _ := ctx.Value(schemas.BifrostContextKeyIsMCPGateway).(bool)
-		if !isMCPGateway {
-			return "", fmt.Errorf(
-				"per-user OAuth for %s requires an identity: attach a Virtual Key or authenticate so the token can be linked to you",
-				client.ExecutionConfig.Name,
-			)
-		}
-		// MCP gateway path without a session token shouldn't happen in practice —
-		// injectMCPSessionIdentity always sets MCPUserSession. Fall through and
-		// let the flow-initiation step surface a clearer error.
+		// No identity column populated for the derived mode. We can neither
+		// look up an existing token nor mint a flow whose result would be
+		// findable on subsequent calls, so refuse early with actionable copy.
+		return "", fmt.Errorf(
+			"per-user OAuth for %s requires an identity: send a Virtual Key (x-bf-vk), authenticate as a user, or set x-bf-mcp-session-id to any opaque string you'll re-send on subsequent calls",
+			client.ExecutionConfig.Name,
+		)
 	}
 
 	accessToken, err := oauth2Provider.GetUserAccessTokenByMode(ctx, mode, identity, client.ExecutionConfig.ID)
@@ -87,8 +81,8 @@ func identityForMode(ctx *schemas.BifrostContext, mode schemas.AuthMode) string 
 		if v, _ := ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID).(string); v != "" {
 			return v
 		}
-	case schemas.AuthModeNone:
-		if v, _ := ctx.Value(schemas.BifrostContextKeyMCPUserSession).(string); v != "" {
+	case schemas.AuthModeSession:
+		if v, _ := ctx.Value(schemas.BifrostContextKeyMCPSessionID).(string); v != "" {
 			return v
 		}
 	}

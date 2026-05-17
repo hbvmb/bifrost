@@ -1155,13 +1155,6 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	mcpSessionsHandler.RegisterRoutes(s.Router, middlewares...)
 	configHandler.RegisterRoutes(s.Router, middlewares...)
 	oauthHandler.RegisterRoutes(s.Router, middlewares...)
-	// OAuth metadata + per-user OAuth endpoints (no auth middleware — must be publicly accessible)
-	oauthMetadataHandler := handlers.NewOAuthMetadataHandler(s.Config)
-	oauthMetadataHandler.RegisterRoutes(s.Router)
-	perUserOAuthHandler := handlers.NewPerUserOAuthHandler(s.Config)
-	perUserOAuthHandler.RegisterRoutes(s.Router)
-	consentHandler := handlers.NewConsentHandler(s.Config)
-	consentHandler.RegisterRoutes(s.Router)
 	if pluginsHandler != nil {
 		pluginsHandler.RegisterRoutes(s.Router, middlewares...)
 	}

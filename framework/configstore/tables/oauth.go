@@ -163,17 +163,20 @@ type TableOauthUserSession struct {
 	State            string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"-"`         // CSRF state token sent to OAuth provider
 	RedirectURI      string    `gorm:"type:text" json:"-"`                                      // Per-request redirect URI used in authorize step
 	CodeVerifier     string    `gorm:"type:text" json:"-"`                                      // PKCE code verifier (kept secret)
-	SessionToken     string    `gorm:"type:varchar(255)" json:"-"`                              // Bifrost session ID (links to oauth_per_user_sessions)
-	SessionTokenHash string    `gorm:"type:varchar(64);uniqueIndex" json:"-"`                   // SHA-256 hash of SessionToken for secure lookups
-	GatewaySessionID string    `gorm:"type:varchar(255);index" json:"-"`                        // Bifrost MCP gateway session ID (separate from SessionToken)
+	SessionID        string    `gorm:"type:varchar(255);index" json:"-"`                        // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows. Stored plaintext (not a bearer credential; same trust model as a VK value).
+	GatewaySessionID string    `gorm:"type:varchar(255);index" json:"-"`                        // Bifrost MCP gateway session ID (legacy oauth-server flow; to be removed in OSS-4).
 	VirtualKeyID     *string   `gorm:"type:varchar(255);index" json:"virtual_key_id"`           // VK identity (propagated to oauth_user_tokens)
 	UserID           *string   `gorm:"type:varchar(255);index" json:"user_id"`                  // Enterprise user identity (propagated to oauth_user_tokens); nullable for deferred-fill user-mode flows
-	FlowMode         string    `gorm:"type:varchar(20);not null;default:'vk'" json:"flow_mode"` // 'user' | 'vk' | 'none' — mirrors the token row's AuthMode; immutable after creation
+	FlowMode         string    `gorm:"type:varchar(20);not null;default:'vk'" json:"flow_mode"` // 'user' | 'vk' | 'session' — mirrors the token row's AuthMode; immutable after creation
 	Status           string    `gorm:"type:varchar(50);not null;index" json:"status"`           // "pending", "authorized", "failed", "expired"
 	EncryptionStatus string    `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	ExpiresAt        time.Time `gorm:"index;not null" json:"expires_at"` // Flow expiration (15 min)
 	CreatedAt        time.Time `gorm:"index;not null" json:"created_at"`
 	UpdatedAt        time.Time `gorm:"index;not null" json:"updated_at"`
+
+	// Display-only relations (no DB-level FK constraint; preloaded for sessions UI).
+	MCPClient  *TableMCPClient  `gorm:"foreignKey:MCPClientID;references:ClientID" json:"-"`
+	VirtualKey *TableVirtualKey `gorm:"foreignKey:VirtualKeyID;references:ID" json:"-"`
 }
 
 func (TableOauthUserSession) TableName() string {
@@ -183,9 +186,6 @@ func (TableOauthUserSession) TableName() string {
 func (s *TableOauthUserSession) BeforeSave(tx *gorm.DB) error {
 	if s.Status == "" {
 		s.Status = "pending"
-	}
-	if s.SessionToken != "" {
-		s.SessionTokenHash = encrypt.HashSHA256(s.SessionToken)
 	}
 	if encrypt.IsEnabled() {
 		if s.CodeVerifier != "" {
@@ -209,16 +209,15 @@ func (s *TableOauthUserSession) AfterFind(tx *gorm.DB) error {
 
 // TableOauthUserToken stores per-user OAuth credentials.
 // Each record holds the access/refresh tokens for a specific identity × MCP client pair.
-// Exactly one identity column (UserID, VirtualKeyID, or SessionTokenHash) is populated
+// Exactly one identity column (UserID, VirtualKeyID, or SessionID) is populated
 // per row; AuthMode records which one.
 type TableOauthUserToken struct {
 	ID               string     `gorm:"type:varchar(255);primaryKey" json:"id"`                   // Token UUID
-	SessionToken     string     `gorm:"type:varchar(255)" json:"-"`                               // Bifrost session token (none-mode bucket; empty for vk/user modes)
-	SessionTokenHash string     `gorm:"type:varchar(64);index" json:"-"`                          // SHA-256 hash of SessionToken for secure lookups
+	SessionID        string     `gorm:"type:varchar(255);index" json:"-"`                         // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows.
 	VirtualKeyID     *string    `gorm:"type:varchar(255);index" json:"virtual_key_id"`            // VK identity (vk-mode rows)
 	UserID           *string    `gorm:"type:varchar(255);index" json:"user_id"`                   // User identity (user-mode rows; populated by enterprise middleware/governance)
 	MCPClientID      string     `gorm:"type:varchar(255);not null;index" json:"mcp_client_id"`    // Which MCP server
-	AuthMode         string     `gorm:"type:varchar(20);not null" json:"auth_mode"`               // 'user' | 'vk' | 'none' — which identity column keys this row
+	AuthMode         string     `gorm:"type:varchar(20);not null" json:"auth_mode"`               // 'user' | 'vk' | 'session' — which identity column keys this row
 	Status           string     `gorm:"type:varchar(20);not null;default:'active'" json:"status"` // 'active' | 'orphaned' — orphaned rows are surfaced in UI but never executed
 	OauthConfigID    string     `gorm:"type:varchar(255);not null;index" json:"oauth_config_id"`  // Template OAuth config
 	AccessToken      string     `gorm:"type:text;not null" json:"-"`                              // Encrypted user's OAuth access token
@@ -230,6 +229,10 @@ type TableOauthUserToken struct {
 	EncryptionStatus string     `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	CreatedAt        time.Time  `gorm:"index;not null" json:"created_at"`
 	UpdatedAt        time.Time  `gorm:"index;not null" json:"updated_at"`
+
+	// Display-only relations (no DB-level FK constraint; preloaded for sessions UI).
+	MCPClient  *TableMCPClient  `gorm:"foreignKey:MCPClientID;references:ClientID" json:"-"`
+	VirtualKey *TableVirtualKey `gorm:"foreignKey:VirtualKeyID;references:ID" json:"-"`
 }
 
 func (TableOauthUserToken) TableName() string {
@@ -239,9 +242,6 @@ func (TableOauthUserToken) TableName() string {
 func (t *TableOauthUserToken) BeforeSave(tx *gorm.DB) error {
 	if t.TokenType == "" {
 		t.TokenType = "Bearer"
-	}
-	if t.SessionToken != "" {
-		t.SessionTokenHash = encrypt.HashSHA256(t.SessionToken)
 	}
 	if encrypt.IsEnabled() {
 		if err := encryptString(&t.AccessToken); err != nil {
@@ -301,7 +301,7 @@ type TablePerUserOAuthSession struct {
 	VirtualKeyID     *string          `gorm:"type:varchar(255);index" json:"virtual_key_id"`     // Linked VK identity (set when VK is present during auth)
 	VirtualKey       *TableVirtualKey `gorm:"foreignKey:VirtualKeyID" json:"-"`                  // Linked VK identity (server-only, not serialized)
 	UserID           *string          `gorm:"type:varchar(255);index" json:"user_id"`            // Linked enterprise user identity (set when user ID is present, or stamped at OAuth completion for deferred-fill user-mode flows)
-	AuthMode         string           `gorm:"type:varchar(20);not null" json:"auth_mode"`        // 'user' | 'vk' | 'none' — mirrors the flow's mode; immutable after creation
+	AuthMode         string           `gorm:"type:varchar(20);not null" json:"auth_mode"`        // 'user' | 'vk' | 'session' — mirrors the flow's mode; immutable after creation
 	ExpiresAt        time.Time        `gorm:"index;not null" json:"expires_at"`
 	EncryptionStatus string           `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	CreatedAt        time.Time        `gorm:"index;not null" json:"created_at"`

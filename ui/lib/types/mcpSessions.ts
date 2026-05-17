@@ -1,25 +1,42 @@
 // Types for the MCP Auth Sessions tab + auth landing flow.
 // Mirrors the wire shapes in transports/bifrost-http/handlers/mcp_sessions.go.
 
-export type AuthMode = "user" | "vk" | "none";
+export type AuthMode = "user" | "vk" | "session";
 
 export type MCPSessionKind = "token" | "flow";
 
 // Status values vary by Kind:
 //   token:  "active" | "orphaned"
-//   flow:   "pending" (only pending flows are surfaced; expired/completed are not)
-export type MCPSessionStatus = "active" | "orphaned" | "pending";
+//   flow:   "pending" | "needs_reauth"
+//     - "pending":      fresh auth in progress; user must complete OAuth
+//     - "needs_reauth": refresh token died upstream; the token row was deleted
+//                       and this flow row is the marker telling the user to
+//                       reconnect. The original PKCE state is dead; the user
+//                       must initiate a new flow (next inference call will).
+export type MCPSessionStatus = "active" | "orphaned" | "pending" | "needs_reauth";
+
+export interface MCPClientSummary {
+	client_id: string;
+	name: string;
+}
+
+export interface VirtualKeySummary {
+	id: string;
+	name: string;
+}
 
 export interface MCPSessionRow {
 	id: string;
 	kind: MCPSessionKind;
 	auth_mode: AuthMode;
 	user_id?: string | null;
-	virtual_key_id?: string | null;
-	mcp_client_id: string;
+	virtual_key?: VirtualKeySummary | null;
+	mcp_client?: MCPClientSummary | null;
+	session_id?: string | null;
 	status: MCPSessionStatus;
 	expires_at?: string | null;
 	created_at: string;
+	last_refreshed_at?: string | null;
 	oauth_config_id?: string;
 }
 
@@ -35,11 +52,11 @@ export interface MCPSessionReauthResponse {
 export interface MCPFlowDetail {
 	id: string;
 	flow_mode: AuthMode;
-	status: "pending" | "authorized" | "failed" | "expired";
-	mcp_client_id: string;
+	status: "pending" | "authorized" | "failed" | "expired" | "needs_reauth";
+	mcp_client?: MCPClientSummary | null;
 	oauth_config_id: string;
 	user_id?: string | null;
-	virtual_key_id?: string | null;
+	virtual_key?: VirtualKeySummary | null;
 	expires_at: string;
 	created_at: string;
 }

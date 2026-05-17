@@ -37,13 +37,13 @@ type OAuth2Provider interface {
 	// identity dimension determined by mode. No fallback chain — exactly one
 	// identity column is queried. Filters status='active' so orphaned rows never
 	// satisfy a lookup. identity is the user ID for AuthModeUser, the VK row ID
-	// for AuthModeVK, and the raw (unhashed) session token for AuthModeNone.
+	// for AuthModeVK, and the raw (unhashed) session token for AuthModeSession.
 	GetUserAccessTokenByMode(ctx context.Context, mode AuthMode, identity, mcpClientID string) (string, error)
 
 	// InitiateUserOAuthFlow creates a per-user OAuth session and returns the
 	// authorization URL. flowMode tags the row's flow_mode and decides which
 	// identity column gets populated from context (UserID for AuthModeUser, the
-	// resolved VK row ID for AuthModeVK, neither for AuthModeNone). For
+	// resolved VK row ID for AuthModeVK, neither for AuthModeSession). For
 	// AuthModeUser flows where no UserID is available in context yet (external
 	// MCP client OAuth init), the column is left NULL and stamped at completion.
 	// Returns (flow initiation details, session ID for polling, error).
