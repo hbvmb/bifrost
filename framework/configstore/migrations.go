@@ -740,6 +740,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationDropAllowDirectKeysColumnDDL(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddOAuthAuthModeColumns(ctx, db); err != nil {
+		return err
+	}
 	if err := migrationAddTeamCalendarAlignedColumn(ctx, db); err != nil {
 		return err
 	}
@@ -7566,6 +7569,173 @@ func migrationUniqueTeamNames(ctx context.Context, db *gorm.DB) error {
 		},
 		Rollback: func(tx *gorm.DB) error {
 			_ = tx.Migrator().DropIndex(&tables.TableTeam{}, "idx_governance_teams_name")
+			return nil
+		},
+	})
+}
+
+// migrationAddOAuthAuthModeColumns adds the AuthMode/Status/FlowMode discriminator
+// columns to the per-user OAuth tables, backfills them from existing identity
+// column population, drops the legacy non-unique composite indexes on
+// oauth_user_tokens, and creates partial unique indexes (one per identity
+// dimension).
+func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
+	return RunSingleMigration(ctx, db, &migrator.Migration{
+		ID: "add_oauth_auth_mode_columns",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+
+			// 1) oauth_user_tokens: add status + auth_mode
+			if mg.HasTable(&tables.TableOauthUserToken{}) {
+				if !mg.HasColumn(&tables.TableOauthUserToken{}, "status") {
+					if err := mg.AddColumn(&tables.TableOauthUserToken{}, "Status"); err != nil {
+						return fmt.Errorf("add status to oauth_user_tokens: %w", err)
+					}
+				}
+				if !mg.HasColumn(&tables.TableOauthUserToken{}, "auth_mode") {
+					if err := mg.AddColumn(&tables.TableOauthUserToken{}, "AuthMode"); err != nil {
+						return fmt.Errorf("add auth_mode to oauth_user_tokens: %w", err)
+					}
+				}
+				// Backfill auth_mode from whichever identity column is populated.
+				// Priority: user_id > virtual_key_id > session_token_hash. Rows with
+				// none of these are legacy/anomalous and stay at the column default ('vk').
+				if err := tx.Exec(`
+					UPDATE oauth_user_tokens
+					SET auth_mode = CASE
+						WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
+						WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
+						WHEN session_token_hash IS NOT NULL AND session_token_hash != '' THEN 'none'
+						ELSE 'vk'
+					END
+				`).Error; err != nil {
+					return fmt.Errorf("backfill oauth_user_tokens.auth_mode: %w", err)
+				}
+				// Ensure status is populated for legacy rows.
+				if err := tx.Exec(`UPDATE oauth_user_tokens SET status = 'active' WHERE status IS NULL OR status = ''`).Error; err != nil {
+					return fmt.Errorf("backfill oauth_user_tokens.status: %w", err)
+				}
+
+				// Drop legacy non-unique composite indexes. Replaced by partial unique indexes below.
+				if mg.HasIndex(&tables.TableOauthUserToken{}, "idx_vk_mcp") {
+					if err := mg.DropIndex(&tables.TableOauthUserToken{}, "idx_vk_mcp"); err != nil {
+						return fmt.Errorf("drop idx_vk_mcp: %w", err)
+					}
+				}
+				if mg.HasIndex(&tables.TableOauthUserToken{}, "idx_user_mcp") {
+					if err := mg.DropIndex(&tables.TableOauthUserToken{}, "idx_user_mcp"); err != nil {
+						return fmt.Errorf("drop idx_user_mcp: %w", err)
+					}
+				}
+
+				// Partial unique indexes (one per identity dimension). Both Postgres
+				// and SQLite (3.8+) support WHERE on indexes.
+				partialUniques := []string{
+					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_user_mcp
+						ON oauth_user_tokens (user_id, mcp_client_id)
+						WHERE user_id IS NOT NULL`,
+					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_vk_mcp
+						ON oauth_user_tokens (virtual_key_id, mcp_client_id)
+						WHERE virtual_key_id IS NOT NULL`,
+					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_session_mcp
+						ON oauth_user_tokens (session_token_hash, mcp_client_id)
+						WHERE session_token_hash IS NOT NULL AND session_token_hash != ''`,
+				}
+				for _, stmt := range partialUniques {
+					if err := tx.Exec(stmt).Error; err != nil {
+						return fmt.Errorf("create partial unique index on oauth_user_tokens: %w", err)
+					}
+				}
+
+				// Partial index on orphaned rows to keep the sessions-tab "orphaned" query cheap.
+				if err := tx.Exec(`
+					CREATE INDEX IF NOT EXISTS idx_oauth_user_tokens_orphaned
+						ON oauth_user_tokens (status)
+						WHERE status = 'orphaned'
+				`).Error; err != nil {
+					return fmt.Errorf("create orphaned-status index: %w", err)
+				}
+			}
+
+			// 2) oauth_user_sessions: add flow_mode
+			if mg.HasTable(&tables.TableOauthUserSession{}) {
+				if !mg.HasColumn(&tables.TableOauthUserSession{}, "flow_mode") {
+					if err := mg.AddColumn(&tables.TableOauthUserSession{}, "FlowMode"); err != nil {
+						return fmt.Errorf("add flow_mode to oauth_user_sessions: %w", err)
+					}
+				}
+				if err := tx.Exec(`
+					UPDATE oauth_user_sessions
+					SET flow_mode = CASE
+						WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
+						WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
+						ELSE 'none'
+					END
+				`).Error; err != nil {
+					return fmt.Errorf("backfill oauth_user_sessions.flow_mode: %w", err)
+				}
+			}
+
+			// 3) oauth_per_user_sessions: add auth_mode (user_id already exists)
+			if mg.HasTable(&tables.TablePerUserOAuthSession{}) {
+				if !mg.HasColumn(&tables.TablePerUserOAuthSession{}, "auth_mode") {
+					if err := mg.AddColumn(&tables.TablePerUserOAuthSession{}, "AuthMode"); err != nil {
+						return fmt.Errorf("add auth_mode to oauth_per_user_sessions: %w", err)
+					}
+				}
+				if err := tx.Exec(`
+					UPDATE oauth_per_user_sessions
+					SET auth_mode = CASE
+						WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
+						WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
+						ELSE 'none'
+					END
+				`).Error; err != nil {
+					return fmt.Errorf("backfill oauth_per_user_sessions.auth_mode: %w", err)
+				}
+			}
+
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+
+			// Drop partial unique + orphan indexes.
+			for _, name := range []string{
+				"idx_oauth_user_tokens_user_mcp",
+				"idx_oauth_user_tokens_vk_mcp",
+				"idx_oauth_user_tokens_session_mcp",
+				"idx_oauth_user_tokens_orphaned",
+			} {
+				if err := tx.Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
+					return fmt.Errorf("drop %s: %w", name, err)
+				}
+			}
+
+			// Restore legacy composite non-unique indexes.
+			if mg.HasTable(&tables.TableOauthUserToken{}) {
+				if err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_vk_mcp ON oauth_user_tokens (virtual_key_id, mcp_client_id)`).Error; err != nil {
+					return fmt.Errorf("restore idx_vk_mcp: %w", err)
+				}
+				if err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_user_mcp ON oauth_user_tokens (user_id, mcp_client_id)`).Error; err != nil {
+					return fmt.Errorf("restore idx_user_mcp: %w", err)
+				}
+				if mg.HasColumn(&tables.TableOauthUserToken{}, "status") {
+					_ = mg.DropColumn(&tables.TableOauthUserToken{}, "Status")
+				}
+				if mg.HasColumn(&tables.TableOauthUserToken{}, "auth_mode") {
+					_ = mg.DropColumn(&tables.TableOauthUserToken{}, "AuthMode")
+				}
+			}
+			if mg.HasTable(&tables.TableOauthUserSession{}) && mg.HasColumn(&tables.TableOauthUserSession{}, "flow_mode") {
+				_ = mg.DropColumn(&tables.TableOauthUserSession{}, "FlowMode")
+			}
+			if mg.HasTable(&tables.TablePerUserOAuthSession{}) && mg.HasColumn(&tables.TablePerUserOAuthSession{}, "auth_mode") {
+				_ = mg.DropColumn(&tables.TablePerUserOAuthSession{}, "AuthMode")
+			}
+
 			return nil
 		},
 	})

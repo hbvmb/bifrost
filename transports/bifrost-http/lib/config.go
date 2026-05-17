@@ -292,8 +292,9 @@ type Config struct {
 	pluginStatusMu sync.RWMutex
 	pluginStatus   map[string]schemas.PluginStatus // name -> status
 
-	OAuthProvider      *oauth2.OAuth2Provider
-	TokenRefreshWorker *oauth2.TokenRefreshWorker
+	OAuthProvider       *oauth2.OAuth2Provider
+	TokenRefreshWorker  *oauth2.TokenRefreshWorker
+	OAuthSweepWorker    *oauth2.PerUserOAuthSweepWorker
 
 	// Async job executor (initialized during setup if LogsStore + governance are available)
 	AsyncJobExecutor *logstore.AsyncJobExecutor
@@ -3084,6 +3085,13 @@ func initFrameworkConfig(ctx context.Context, config *Config, configData *Config
 		config.TokenRefreshWorker.Start(ctx)
 	}
 
+	// Start per-user OAuth sweep worker: expires stale pending flows and reaps
+	// long-orphaned token rows. Orphan retention defaults to 30 days.
+	config.OAuthSweepWorker = oauth2.NewPerUserOAuthSweepWorker(config.OAuthProvider, 30*24*time.Hour, logger)
+	if config.OAuthSweepWorker != nil {
+		config.OAuthSweepWorker.Start(ctx)
+	}
+
 	config.FrameworkConfig = &framework.FrameworkConfig{
 		Pricing: pricingConfig,
 	}
@@ -3619,6 +3627,9 @@ func (c *Config) Close(ctx context.Context) {
 	}
 	if c.TokenRefreshWorker != nil {
 		c.TokenRefreshWorker.Stop()
+	}
+	if c.OAuthSweepWorker != nil {
+		c.OAuthSweepWorker.Stop()
 	}
 	if c.KVStore != nil {
 		c.KVStore.Close()

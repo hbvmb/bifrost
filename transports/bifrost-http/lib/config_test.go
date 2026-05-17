@@ -1202,6 +1202,10 @@ func (m *MockConfigStore) GetOauthUserTokenByIdentity(ctx context.Context, virtu
 	return nil, nil
 }
 
+func (m *MockConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error) {
+	return nil, nil
+}
+
 func (m *MockConfigStore) GetOauthUserTokenBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserToken, error) {
 	return nil, nil
 }
@@ -1220,6 +1224,34 @@ func (m *MockConfigStore) DeleteOauthUserToken(ctx context.Context, id string) e
 
 func (m *MockConfigStore) DeleteOauthUserTokensByMCPClient(ctx context.Context, mcpClientID string) error {
 	return nil
+}
+
+func (m *MockConfigStore) DeleteOauthUserTokensByVK(ctx context.Context, vkID string) error {
+	return nil
+}
+
+func (m *MockConfigStore) DeleteOauthUserTokensByUser(ctx context.Context, userID string) error {
+	return nil
+}
+
+func (m *MockConfigStore) OrphanOauthUserTokensForUserMCP(ctx context.Context, userID, mcpClientID string) error {
+	return nil
+}
+
+func (m *MockConfigStore) OrphanOauthUserTokensForUser(ctx context.Context, userID string) error {
+	return nil
+}
+
+func (m *MockConfigStore) GetActiveOauthUserTokensByUser(ctx context.Context, userID string) ([]tables.TableOauthUserToken, error) {
+	return nil, nil
+}
+
+func (m *MockConfigStore) DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
+func (m *MockConfigStore) DeleteOrphanedOauthUserTokens(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
 }
 
 // Per-user OAuth Authorization Server CRUD

@@ -28,11 +28,26 @@ type OAuth2Provider interface {
 	// GetUserAccessTokenByIdentity retrieves the upstream access token for a user
 	// identified by virtualKeyID, userID, or sessionToken (fallback), for a specific
 	// MCP client. Tokens looked up by identity persist across sessions.
+	//
+	// Deprecated: use GetUserAccessTokenByMode. Retained only for the legacy
+	// server-rendered consent handler.
 	GetUserAccessTokenByIdentity(ctx context.Context, virtualKeyID, userID, sessionToken, mcpClientID string) (string, error)
 
-	// InitiateUserOAuthFlow creates a per-user OAuth session and returns the authorization URL.
+	// GetUserAccessTokenByMode retrieves the upstream access token for a single
+	// identity dimension determined by mode. No fallback chain — exactly one
+	// identity column is queried. Filters status='active' so orphaned rows never
+	// satisfy a lookup. identity is the user ID for AuthModeUser, the VK row ID
+	// for AuthModeVK, and the raw (unhashed) session token for AuthModeNone.
+	GetUserAccessTokenByMode(ctx context.Context, mode AuthMode, identity, mcpClientID string) (string, error)
+
+	// InitiateUserOAuthFlow creates a per-user OAuth session and returns the
+	// authorization URL. flowMode tags the row's flow_mode and decides which
+	// identity column gets populated from context (UserID for AuthModeUser, the
+	// resolved VK row ID for AuthModeVK, neither for AuthModeNone). For
+	// AuthModeUser flows where no UserID is available in context yet (external
+	// MCP client OAuth init), the column is left NULL and stamped at completion.
 	// Returns (flow initiation details, session ID for polling, error).
-	InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string) (*OAuth2FlowInitiation, string, error)
+	InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string, flowMode AuthMode) (*OAuth2FlowInitiation, string, error)
 
 	// CompleteUserOAuthFlow handles the OAuth callback for a per-user flow.
 	// Returns the session token that the user should send on subsequent requests.
@@ -43,6 +58,28 @@ type OAuth2Provider interface {
 
 	// RevokeUserToken revokes a per-user OAuth token and marks the session as revoked.
 	RevokeUserToken(ctx context.Context, sessionToken string) error
+
+	// Cascade primitives. Identity-agnostic and mechanical — the caller decides
+	// the policy (e.g. "does this user still have another VK granting access to
+	// this MCP?") and invokes the appropriate primitive.
+
+	// DeleteTokensForVK hard-deletes vk-keyed rows for the given VK row ID.
+	DeleteTokensForVK(ctx context.Context, vkID string) error
+
+	// DeleteTokensForUser hard-deletes user-keyed rows for the given user ID.
+	DeleteTokensForUser(ctx context.Context, userID string) error
+
+	// DeleteTokensForMCPClient hard-deletes all rows for the given MCP client.
+	DeleteTokensForMCPClient(ctx context.Context, mcpClientID string) error
+
+	// OrphanTokensForUserMCP flips status to 'orphaned' on the user-keyed row
+	// for (userID, mcpClientID). Orphaned rows are surfaced for inspection but
+	// never satisfy a token lookup.
+	OrphanTokensForUserMCP(ctx context.Context, userID, mcpClientID string) error
+
+	// OrphanTokensForUser flips status to 'orphaned' on all user-keyed rows
+	// for the given user. Bulk variant for ownership transfers / similar ops.
+	OrphanTokensForUser(ctx context.Context, userID string) error
 }
 
 // OauthConfig represents OAuth client configuration

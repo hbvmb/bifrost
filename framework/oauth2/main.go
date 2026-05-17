@@ -796,7 +796,11 @@ func generateSessionToken() (string, error) {
 
 // InitiateUserOAuthFlow creates a per-user OAuth session and returns the authorization URL.
 // It reuses the template OAuth config (which holds client_id, token_url, etc.) to build the flow.
-func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string) (*schemas.OAuth2FlowInitiation, string, error) {
+//
+// flowMode tags the row's flow_mode column and selects which identity column
+// is populated from context. The completer reads flow_mode to write the
+// corresponding token row with matching auth_mode.
+func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string, flowMode schemas.AuthMode) (*schemas.OAuth2FlowInitiation, string, error) {
 	// Load the template OAuth config
 	templateConfig, err := p.configStore.GetOauthConfigByID(ctx, oauthConfigID)
 	if err != nil {
@@ -828,12 +832,32 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 	sessionID := uuid.New().String()
 	expiresAt := time.Now().Add(15 * time.Minute)
 
-	// Propagate identity from context so the callback can link the token to the user
-	virtualKeyID, _ := ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID).(string)
-	userID, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string)
-	// For OSS: prefer X-Bf-User-Id header as user identity
-	if mcpUserID, _ := ctx.Value(schemas.BifrostContextKeyMCPUserID).(string); mcpUserID != "" {
-		userID = mcpUserID
+	// Populate identity columns strictly from flowMode. Other context identities
+	// are intentionally ignored — single-identity invariant maintained at write.
+	var (
+		vkId *string
+		uid  *string
+	)
+	switch flowMode {
+	case schemas.AuthModeUser:
+		if v, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string); v != "" {
+			uid = &v
+		} else if v, _ := ctx.Value(schemas.BifrostContextKeyMCPUserID).(string); v != "" {
+			// Legacy X-Bf-User-Id back-compat.
+			uid = &v
+		}
+		// Else: leave nil — deferred-fill for external MCP client OAuth init.
+		// The completer stamps user_id from its own context.
+	case schemas.AuthModeVK:
+		if v, _ := ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID).(string); v != "" {
+			vkId = &v
+		} else {
+			return nil, "", fmt.Errorf("vk-mode flow requires a resolved virtual key in context")
+		}
+	case schemas.AuthModeNone:
+		// Identity comes from the session token alone.
+	default:
+		return nil, "", fmt.Errorf("unknown auth mode for flow: %s", flowMode)
 	}
 
 	// If a Bifrost MCP session token is present in context, reuse it as the session token
@@ -845,14 +869,6 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to generate session token: %w", err)
 		}
-	}
-	var vkId *string
-	if virtualKeyID != "" {
-		vkId = &virtualKeyID
-	}
-	var uid *string
-	if userID != "" {
-		uid = &userID
 	}
 	// session_token_hash has a unique index, so if the user is re-authenticating
 	// with a session token that already has a row (e.g. after a previous
@@ -872,6 +888,7 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 		existing.CodeVerifier = codeVerifier
 		existing.VirtualKeyID = vkId
 		existing.UserID = uid
+		existing.FlowMode = string(flowMode)
 		existing.Status = "pending"
 		existing.ExpiresAt = expiresAt
 		if err := p.configStore.UpdateOauthUserSession(ctx, existing); err != nil {
@@ -889,6 +906,7 @@ func (p *OAuth2Provider) InitiateUserOAuthFlow(ctx context.Context, oauthConfigI
 			SessionToken:  sessionToken,
 			VirtualKeyID:  vkId,
 			UserID:        uid,
+			FlowMode:      string(flowMode),
 			Status:        "pending",
 			ExpiresAt:     expiresAt,
 		}
@@ -985,7 +1003,50 @@ func (p *OAuth2Provider) CompleteUserOAuthFlow(ctx context.Context, state string
 	}
 	scopesJSON, _ := json.Marshal(scopes)
 
-	// Create per-user OAuth token record, propagating identity from session
+	// Resolve identity columns from the flow row, honoring its flow_mode. Only
+	// the column that matches the mode is populated on the token row; the others
+	// stay nil to maintain the single-identity invariant. For user-mode flows
+	// where the row's UserID was deferred at init time, stamp from completer
+	// context here (legacy MCPUserID also honored for back-compat).
+	flowMode := schemas.AuthMode(session.FlowMode)
+	if flowMode == "" {
+		// Defensive default for rows written before the flow_mode column existed.
+		flowMode = schemas.AuthModeVK
+	}
+	var (
+		tokenVKID    *string
+		tokenUserID  *string
+	)
+	switch flowMode {
+	case schemas.AuthModeUser:
+		tokenUserID = session.UserID
+		if tokenUserID == nil || *tokenUserID == "" {
+			// Deferred fill: pull from completer context.
+			if v, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string); v != "" {
+				tokenUserID = &v
+			} else if v, _ := ctx.Value(schemas.BifrostContextKeyMCPUserID).(string); v != "" {
+				tokenUserID = &v
+			}
+		}
+		if tokenUserID == nil || *tokenUserID == "" {
+			session.Status = "failed"
+			p.configStore.UpdateOauthUserSession(ctx, session)
+			return "", fmt.Errorf("user-mode oauth flow has no user_id at completion (neither flow nor completer context)")
+		}
+		// Stamp the resolved user_id back on the flow for audit.
+		session.UserID = tokenUserID
+	case schemas.AuthModeVK:
+		tokenVKID = session.VirtualKeyID
+		if tokenVKID == nil || *tokenVKID == "" {
+			session.Status = "failed"
+			p.configStore.UpdateOauthUserSession(ctx, session)
+			return "", fmt.Errorf("vk-mode oauth flow has no virtual_key_id at completion")
+		}
+	case schemas.AuthModeNone:
+		// Both identity columns left nil; row is keyed by session_token_hash.
+	}
+
+	// Create per-user OAuth token record
 	var expiresAt *time.Time
 	if tokenResponse.ExpiresIn > 0 {
 		exp := time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
@@ -994,8 +1055,8 @@ func (p *OAuth2Provider) CompleteUserOAuthFlow(ctx context.Context, state string
 	tokenRecord := &tables.TableOauthUserToken{
 		ID:            uuid.New().String(),
 		SessionToken:  sessionToken,
-		VirtualKeyID:  session.VirtualKeyID,
-		UserID:        session.UserID,
+		VirtualKeyID:  tokenVKID,
+		UserID:        tokenUserID,
 		MCPClientID:   session.MCPClientID,
 		OauthConfigID: session.OauthConfigID,
 		AccessToken:   strings.TrimSpace(tokenResponse.AccessToken),
@@ -1003,6 +1064,8 @@ func (p *OAuth2Provider) CompleteUserOAuthFlow(ctx context.Context, state string
 		TokenType:     tokenResponse.TokenType,
 		ExpiresAt:     expiresAt,
 		Scopes:        string(scopesJSON),
+		AuthMode:      string(flowMode),
+		Status:        "active",
 	}
 	if err := p.configStore.CreateOauthUserToken(ctx, tokenRecord); err != nil {
 		return "", fmt.Errorf("failed to create per-user oauth token: %w", err)
@@ -1090,6 +1153,75 @@ func (p *OAuth2Provider) GetUserAccessTokenByIdentity(ctx context.Context, virtu
 		return "", fmt.Errorf("per-user access token is empty after sanitization")
 	}
 	return accessToken, nil
+}
+
+// GetUserAccessTokenByMode retrieves the upstream access token using exactly
+// one identity column determined by mode. No fallback chain. Filters
+// status='active' so orphaned rows never satisfy a lookup.
+func (p *OAuth2Provider) GetUserAccessTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (string, error) {
+	token, err := p.configStore.GetOauthUserTokenByMode(ctx, mode, identity, mcpClientID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load per-user oauth token (mode=%s): %w", mode, err)
+	}
+	if token == nil {
+		return "", schemas.ErrOAuth2TokenNotFound
+	}
+
+	// Refresh only when known-expired and refresh token exists.
+	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) && strings.TrimSpace(token.RefreshToken) != "" {
+		if token.SessionToken == "" {
+			return "", fmt.Errorf("per-user token expired and no session token available for refresh")
+		}
+		if err := p.RefreshUserAccessToken(ctx, token.SessionToken); err != nil {
+			return "", fmt.Errorf("per-user token expired and refresh failed: %w", err)
+		}
+		token, err = p.configStore.GetOauthUserTokenByMode(ctx, mode, identity, mcpClientID)
+		if err != nil || token == nil {
+			return "", fmt.Errorf("failed to reload per-user token after refresh")
+		}
+	}
+	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) {
+		return "", fmt.Errorf("per-user token expired and no refresh token is available; re-authorization required: %w", schemas.ErrOAuth2TokenExpired)
+	}
+
+	accessToken := strings.TrimSpace(token.AccessToken)
+	if accessToken == "" {
+		return "", fmt.Errorf("per-user access token is empty after sanitization")
+	}
+	return accessToken, nil
+}
+
+// ---------- Cascade primitives ----------
+// Identity-agnostic and mechanical — these do exactly what they say and do not
+// consult user/VK relationships. The caller owns the policy decision about
+// when to invoke which.
+
+// DeleteTokensForVK hard-deletes vk-keyed rows for the given VK ID.
+func (p *OAuth2Provider) DeleteTokensForVK(ctx context.Context, vkID string) error {
+	return p.configStore.DeleteOauthUserTokensByVK(ctx, vkID)
+}
+
+// DeleteTokensForUser hard-deletes user-keyed rows for the given user ID.
+func (p *OAuth2Provider) DeleteTokensForUser(ctx context.Context, userID string) error {
+	return p.configStore.DeleteOauthUserTokensByUser(ctx, userID)
+}
+
+// DeleteTokensForMCPClient hard-deletes all rows for the given MCP client.
+func (p *OAuth2Provider) DeleteTokensForMCPClient(ctx context.Context, mcpClientID string) error {
+	return p.configStore.DeleteOauthUserTokensByMCPClient(ctx, mcpClientID)
+}
+
+// OrphanTokensForUserMCP flips status to 'orphaned' on the user-keyed row for
+// (userID, mcpClientID). The row stays visible in the sessions tab but never
+// satisfies a token lookup.
+func (p *OAuth2Provider) OrphanTokensForUserMCP(ctx context.Context, userID, mcpClientID string) error {
+	return p.configStore.OrphanOauthUserTokensForUserMCP(ctx, userID, mcpClientID)
+}
+
+// OrphanTokensForUser flips status to 'orphaned' on all user-keyed rows for
+// the given user.
+func (p *OAuth2Provider) OrphanTokensForUser(ctx context.Context, userID string) error {
+	return p.configStore.OrphanOauthUserTokensForUser(ctx, userID)
 }
 
 // RefreshUserAccessToken refreshes a per-user OAuth access token.

@@ -320,11 +320,36 @@ type ConfigStore interface {
 
 	// Per-user OAuth token CRUD
 	GetOauthUserTokenByIdentity(ctx context.Context, virtualKeyID, userID, sessionToken, mcpClientID string) (*tables.TableOauthUserToken, error)
+	// GetOauthUserTokenByMode looks up the active token row keyed by a single
+	// identity dimension. Filters status='active'. identity is the user ID for
+	// AuthModeUser, the VK row ID for AuthModeVK, and the raw (unhashed)
+	// session token for AuthModeNone — the store hashes for the lookup.
+	GetOauthUserTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error)
 	GetOauthUserTokenBySessionToken(ctx context.Context, sessionToken string) (*tables.TableOauthUserToken, error)
 	CreateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
 	UpdateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error
 	DeleteOauthUserToken(ctx context.Context, id string) error
 	DeleteOauthUserTokensByMCPClient(ctx context.Context, mcpClientID string) error
+	// DeleteOauthUserTokensByVK hard-deletes vk-keyed rows for the given VK ID.
+	DeleteOauthUserTokensByVK(ctx context.Context, vkID string) error
+	// DeleteOauthUserTokensByUser hard-deletes user-keyed rows for the given user ID.
+	DeleteOauthUserTokensByUser(ctx context.Context, userID string) error
+	// OrphanOauthUserTokensForUserMCP flips status to 'orphaned' on the
+	// user-keyed row for (userID, mcpClientID).
+	OrphanOauthUserTokensForUserMCP(ctx context.Context, userID, mcpClientID string) error
+	// OrphanOauthUserTokensForUser flips status to 'orphaned' on all
+	// user-keyed rows for the given user.
+	OrphanOauthUserTokensForUser(ctx context.Context, userID string) error
+	// GetActiveOauthUserTokensByUser returns all active user-keyed token rows
+	// for the given user (status='active', user_id=userID). Used by callers
+	// computing user-aware cascade decisions and by the sessions UI.
+	GetActiveOauthUserTokensByUser(ctx context.Context, userID string) ([]tables.TableOauthUserToken, error)
+	// DeleteExpiredOauthUserSessions hard-deletes pending OAuth flow rows
+	// whose ExpiresAt has passed. Returns the number of rows removed.
+	DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error)
+	// DeleteOrphanedOauthUserTokens hard-deletes token rows where status='orphaned'
+	// and updated_at is older than olderThan. Returns the number of rows removed.
+	DeleteOrphanedOauthUserTokens(ctx context.Context, olderThan time.Duration) (int64, error)
 
 	// Per-user OAuth Authorization Server CRUD (Bifrost as OAuth server)
 	GetPerUserOAuthClientByClientID(ctx context.Context, clientID string) (*tables.TablePerUserOAuthClient, error)

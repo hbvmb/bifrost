@@ -164,6 +164,22 @@ const (
 // BifrostContextKey is a type for context keys used in Bifrost.
 type BifrostContextKey string
 
+// AuthMode describes which identity dimension a per-user OAuth row is keyed by.
+// It is a derived view of context state at the point of token lookup, never
+// stored as a context key. Derived via BifrostContext.AuthMode().
+type AuthMode string
+
+const (
+	// AuthModeUser — identity is a user id populated by an upstream auth
+	// middleware or plugin. Token rows keyed by user_id.
+	AuthModeUser AuthMode = "user"
+	// AuthModeVK — identity is a virtual key. Token rows keyed by vk_id.
+	AuthModeVK AuthMode = "vk"
+	// AuthModeNone — no enforced identity; browser/session-token bucket.
+	// Only valid when EnforceAuth is false. Token rows keyed by session_token_hash.
+	AuthModeNone AuthMode = "none"
+)
+
 // BifrostContextKeyRequestType is a context key for the request type.
 const (
 	BifrostContextKeySessionToken      BifrostContextKey = "bifrost-session-token" // string (session token for authentication - set by auth middleware)

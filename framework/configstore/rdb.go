@@ -4701,33 +4701,42 @@ func (s *RDBConfigStore) GetOauthUserTokenBySessionToken(ctx context.Context, se
 	return &token, nil
 }
 
-// CreateOauthUserToken creates or replaces a per-user OAuth token.
-// When an identity (VirtualKeyID or UserID) is set, any existing token for the
-// same identity + MCPClientID pair is replaced to keep resolution deterministic.
+// CreateOauthUserToken creates or replaces a per-user OAuth token. Looks up
+// any existing row matching the populated identity column + MCP client and
+// reuses its ID, ensuring the partial-unique index never trips. SessionToken's
+// hash is set in BeforeSave; the upsert lookup uses the hash column to match
+// the unique index. Wrapped in a transaction so SELECT + CREATE/UPDATE is
+// atomic under concurrent same-identity races.
 func (s *RDBConfigStore) CreateOauthUserToken(ctx context.Context, token *tables.TableOauthUserToken) error {
-	// Wrap in a transaction so the SELECT + CREATE/UPDATE is atomic, preventing
-	// duplicate tokens when concurrent requests race on the same identity+client pair.
 	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if token.UserID != nil && *token.UserID != "" {
-			var existing tables.TableOauthUserToken
-			err := dbForUpdate(tx).Where("user_id = ? AND mcp_client_id = ?", *token.UserID, token.MCPClientID).First(&existing).Error
-			if err == nil {
-				token.ID = existing.ID // reuse the row
-				return tx.Save(token).Error
-			}
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("failed to query oauth user token: %w", err)
-			}
-		} else if token.VirtualKeyID != nil && *token.VirtualKeyID != "" {
-			var existing tables.TableOauthUserToken
-			err := dbForUpdate(tx).Where("virtual_key_id = ? AND mcp_client_id = ?", *token.VirtualKeyID, token.MCPClientID).First(&existing).Error
-			if err == nil {
-				token.ID = existing.ID // reuse the row
-				return tx.Save(token).Error
-			}
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("failed to query oauth user token: %w", err)
-			}
+		var existing tables.TableOauthUserToken
+		var lookupErr error
+		switch {
+		case token.UserID != nil && *token.UserID != "":
+			lookupErr = dbForUpdate(tx).
+				Where("user_id = ? AND mcp_client_id = ?", *token.UserID, token.MCPClientID).
+				First(&existing).Error
+		case token.VirtualKeyID != nil && *token.VirtualKeyID != "":
+			lookupErr = dbForUpdate(tx).
+				Where("virtual_key_id = ? AND mcp_client_id = ?", *token.VirtualKeyID, token.MCPClientID).
+				First(&existing).Error
+		case token.SessionToken != "":
+			// SessionTokenHash is recomputed by the row's BeforeSave; precompute
+			// here so the upsert lookup matches the partial-unique index column.
+			hash := encrypt.HashSHA256(token.SessionToken)
+			lookupErr = dbForUpdate(tx).
+				Where("session_token_hash = ? AND mcp_client_id = ?", hash, token.MCPClientID).
+				First(&existing).Error
+		default:
+			lookupErr = gorm.ErrRecordNotFound
+		}
+
+		if lookupErr == nil {
+			token.ID = existing.ID // reuse the row so unique index sees an UPDATE, not INSERT
+			return tx.Save(token).Error
+		}
+		if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("failed to query oauth user token: %w", lookupErr)
 		}
 
 		if err := tx.Create(token).Error; err != nil {
@@ -4762,6 +4771,149 @@ func (s *RDBConfigStore) DeleteOauthUserTokensByMCPClient(ctx context.Context, m
 		return fmt.Errorf("failed to delete oauth user tokens for mcp client: %w", result.Error)
 	}
 	return nil
+}
+
+// GetOauthUserTokenByMode looks up an active per-user OAuth token by a single
+// identity dimension. Filters status='active' so orphaned rows never satisfy
+// a lookup.
+func (s *RDBConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error) {
+	if identity == "" || mcpClientID == "" {
+		return nil, nil
+	}
+	var token tables.TableOauthUserToken
+	var result *gorm.DB
+	switch mode {
+	case schemas.AuthModeUser:
+		result = s.DB().WithContext(ctx).
+			Where("user_id = ? AND mcp_client_id = ? AND status = ?", identity, mcpClientID, "active").
+			First(&token)
+	case schemas.AuthModeVK:
+		result = s.DB().WithContext(ctx).
+			Where("virtual_key_id = ? AND mcp_client_id = ? AND status = ?", identity, mcpClientID, "active").
+			First(&token)
+	case schemas.AuthModeNone:
+		// identity is the raw session token; lookup column is its sha256 hash.
+		hash := encrypt.HashSHA256(identity)
+		result = s.DB().WithContext(ctx).
+			Where("session_token_hash = ? AND mcp_client_id = ? AND status = ?", hash, mcpClientID, "active").
+			First(&token)
+	default:
+		return nil, fmt.Errorf("unknown auth mode: %s", mode)
+	}
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get oauth user token by mode %s: %w", mode, result.Error)
+	}
+	return &token, nil
+}
+
+// DeleteOauthUserTokensByVK hard-deletes vk-keyed rows for the given VK ID.
+// Mechanical primitive — callers own the policy decision about when to call this.
+func (s *RDBConfigStore) DeleteOauthUserTokensByVK(ctx context.Context, vkID string) error {
+	if vkID == "" {
+		return nil
+	}
+	result := s.DB().WithContext(ctx).
+		Where("virtual_key_id = ?", vkID).
+		Delete(&tables.TableOauthUserToken{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete oauth user tokens for vk %s: %w", vkID, result.Error)
+	}
+	return nil
+}
+
+// DeleteOauthUserTokensByUser hard-deletes user-keyed rows for the given user ID.
+func (s *RDBConfigStore) DeleteOauthUserTokensByUser(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	result := s.DB().WithContext(ctx).
+		Where("user_id = ?", userID).
+		Delete(&tables.TableOauthUserToken{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete oauth user tokens for user %s: %w", userID, result.Error)
+	}
+	return nil
+}
+
+// OrphanOauthUserTokensForUserMCP flips status to 'orphaned' on the user-keyed
+// row for (userID, mcpClientID). Orphaned rows are surfaced for inspection but
+// never satisfy a lookup.
+func (s *RDBConfigStore) OrphanOauthUserTokensForUserMCP(ctx context.Context, userID, mcpClientID string) error {
+	if userID == "" || mcpClientID == "" {
+		return nil
+	}
+	result := s.DB().WithContext(ctx).
+		Model(&tables.TableOauthUserToken{}).
+		Where("user_id = ? AND mcp_client_id = ? AND status = ?", userID, mcpClientID, "active").
+		Update("status", "orphaned")
+	if result.Error != nil {
+		return fmt.Errorf("failed to orphan oauth user token for (%s, %s): %w", userID, mcpClientID, result.Error)
+	}
+	return nil
+}
+
+// OrphanOauthUserTokensForUser flips status to 'orphaned' on all user-keyed
+// rows for the given user. Bulk variant for ownership-transfer / similar ops.
+func (s *RDBConfigStore) OrphanOauthUserTokensForUser(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	result := s.DB().WithContext(ctx).
+		Model(&tables.TableOauthUserToken{}).
+		Where("user_id = ? AND status = ?", userID, "active").
+		Update("status", "orphaned")
+	if result.Error != nil {
+		return fmt.Errorf("failed to orphan oauth user tokens for user %s: %w", userID, result.Error)
+	}
+	return nil
+}
+
+// GetActiveOauthUserTokensByUser returns all active user-keyed token rows for
+// the given user. Used by user-aware cascade callers and the sessions UI.
+func (s *RDBConfigStore) GetActiveOauthUserTokensByUser(ctx context.Context, userID string) ([]tables.TableOauthUserToken, error) {
+	if userID == "" {
+		return nil, nil
+	}
+	var tokens []tables.TableOauthUserToken
+	if err := s.DB().WithContext(ctx).
+		Where("user_id = ? AND status = ?", userID, "active").
+		Find(&tokens).Error; err != nil {
+		return nil, fmt.Errorf("failed to list active user-keyed oauth tokens for user %s: %w", userID, err)
+	}
+	return tokens, nil
+}
+
+// DeleteExpiredOauthUserSessions hard-deletes pending OAuth flow rows whose
+// ExpiresAt has passed. Called periodically by the sweep worker; returns the
+// number of rows removed so the worker can log it.
+func (s *RDBConfigStore) DeleteExpiredOauthUserSessions(ctx context.Context) (int64, error) {
+	result := s.DB().WithContext(ctx).
+		Where("expires_at < ? AND status = ?", time.Now(), "pending").
+		Delete(&tables.TableOauthUserSession{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to delete expired oauth user sessions: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// DeleteOrphanedOauthUserTokens hard-deletes token rows that have been in
+// 'orphaned' state longer than olderThan. Skipped silently when olderThan
+// is zero or negative.
+func (s *RDBConfigStore) DeleteOrphanedOauthUserTokens(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-olderThan)
+	result := s.DB().WithContext(ctx).
+		Where("status = ? AND updated_at < ?", "orphaned", cutoff).
+		Delete(&tables.TableOauthUserToken{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to delete orphaned oauth user tokens: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // ---------- Per-User OAuth Authorization Server CRUD ----------

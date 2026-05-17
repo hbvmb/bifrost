@@ -167,7 +167,8 @@ type TableOauthUserSession struct {
 	SessionTokenHash string    `gorm:"type:varchar(64);uniqueIndex" json:"-"`                   // SHA-256 hash of SessionToken for secure lookups
 	GatewaySessionID string    `gorm:"type:varchar(255);index" json:"-"`                        // Bifrost MCP gateway session ID (separate from SessionToken)
 	VirtualKeyID     *string   `gorm:"type:varchar(255);index" json:"virtual_key_id"`           // VK identity (propagated to oauth_user_tokens)
-	UserID           *string   `gorm:"type:varchar(255);index" json:"user_id"`                  // Enterprise user identity (propagated to oauth_user_tokens)
+	UserID           *string   `gorm:"type:varchar(255);index" json:"user_id"`                  // Enterprise user identity (propagated to oauth_user_tokens); nullable for deferred-fill user-mode flows
+	FlowMode         string    `gorm:"type:varchar(20);not null;default:'vk'" json:"flow_mode"` // 'user' | 'vk' | 'none' — mirrors the token row's AuthMode; immutable after creation
 	Status           string    `gorm:"type:varchar(50);not null;index" json:"status"`           // "pending", "authorized", "failed", "expired"
 	EncryptionStatus string    `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	ExpiresAt        time.Time `gorm:"index;not null" json:"expires_at"` // Flow expiration (15 min)
@@ -207,22 +208,25 @@ func (s *TableOauthUserSession) AfterFind(tx *gorm.DB) error {
 }
 
 // TableOauthUserToken stores per-user OAuth credentials.
-// Each record holds the access/refresh tokens for a specific user session + MCP client pair.
-// Lookup is by SessionToken.
+// Each record holds the access/refresh tokens for a specific identity × MCP client pair.
+// Exactly one identity column (UserID, VirtualKeyID, or SessionTokenHash) is populated
+// per row; AuthMode records which one.
 type TableOauthUserToken struct {
-	ID               string     `gorm:"type:varchar(255);primaryKey" json:"id"`                                              // Token UUID
-	SessionToken     string     `gorm:"type:varchar(255)" json:"-"`                                                          // Maps to Bifrost session (fallback for anonymous users)
-	SessionTokenHash string     `gorm:"type:varchar(64);index" json:"-"`                                                     // SHA-256 hash of SessionToken for secure lookups
-	VirtualKeyID     *string    `gorm:"type:varchar(255);index:idx_vk_mcp" json:"virtual_key_id"`                            // VK identity (persistent across sessions)
-	UserID           *string    `gorm:"type:varchar(255);index:idx_user_mcp" json:"user_id"`                                 // Enterprise user identity (persistent across sessions)
-	MCPClientID      string     `gorm:"type:varchar(255);not null;index:idx_vk_mcp;index:idx_user_mcp" json:"mcp_client_id"` // Which MCP server
-	OauthConfigID    string     `gorm:"type:varchar(255);not null;index" json:"oauth_config_id"`                             // Template OAuth config
-	AccessToken      string     `gorm:"type:text;not null" json:"-"`                                                         // Encrypted user's OAuth access token
-	RefreshToken     string     `gorm:"type:text" json:"-"`                                                                  // Encrypted user's OAuth refresh token
-	TokenType        string     `gorm:"type:varchar(50);not null" json:"token_type"`                                         // "Bearer"
-	ExpiresAt        *time.Time `gorm:"index" json:"expires_at,omitempty"`                                                   // Token expiry (nil means unknown/non-expiring)
-	Scopes           string     `gorm:"type:text" json:"scopes"`                                                             // JSON array of granted scopes
-	LastRefreshedAt  *time.Time `gorm:"index" json:"last_refreshed_at,omitempty"`                                            // Last refresh time
+	ID               string     `gorm:"type:varchar(255);primaryKey" json:"id"`                   // Token UUID
+	SessionToken     string     `gorm:"type:varchar(255)" json:"-"`                               // Bifrost session token (none-mode bucket; empty for vk/user modes)
+	SessionTokenHash string     `gorm:"type:varchar(64);index" json:"-"`                          // SHA-256 hash of SessionToken for secure lookups
+	VirtualKeyID     *string    `gorm:"type:varchar(255);index" json:"virtual_key_id"`            // VK identity (vk-mode rows)
+	UserID           *string    `gorm:"type:varchar(255);index" json:"user_id"`                   // User identity (user-mode rows; populated by enterprise middleware/governance)
+	MCPClientID      string     `gorm:"type:varchar(255);not null;index" json:"mcp_client_id"`    // Which MCP server
+	AuthMode         string     `gorm:"type:varchar(20);not null" json:"auth_mode"`               // 'user' | 'vk' | 'none' — which identity column keys this row
+	Status           string     `gorm:"type:varchar(20);not null;default:'active'" json:"status"` // 'active' | 'orphaned' — orphaned rows are surfaced in UI but never executed
+	OauthConfigID    string     `gorm:"type:varchar(255);not null;index" json:"oauth_config_id"`  // Template OAuth config
+	AccessToken      string     `gorm:"type:text;not null" json:"-"`                              // Encrypted user's OAuth access token
+	RefreshToken     string     `gorm:"type:text" json:"-"`                                       // Encrypted user's OAuth refresh token
+	TokenType        string     `gorm:"type:varchar(50);not null" json:"token_type"`              // "Bearer"
+	ExpiresAt        *time.Time `gorm:"index" json:"expires_at,omitempty"`                        // Token expiry (nil means unknown/non-expiring)
+	Scopes           string     `gorm:"type:text" json:"scopes"`                                  // JSON array of granted scopes
+	LastRefreshedAt  *time.Time `gorm:"index" json:"last_refreshed_at,omitempty"`                 // Last refresh time
 	EncryptionStatus string     `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	CreatedAt        time.Time  `gorm:"index;not null" json:"created_at"`
 	UpdatedAt        time.Time  `gorm:"index;not null" json:"updated_at"`
@@ -296,7 +300,8 @@ type TablePerUserOAuthSession struct {
 	ClientID         string           `gorm:"type:varchar(255);not null;index" json:"client_id"` // Which OAuth client registered this session
 	VirtualKeyID     *string          `gorm:"type:varchar(255);index" json:"virtual_key_id"`     // Linked VK identity (set when VK is present during auth)
 	VirtualKey       *TableVirtualKey `gorm:"foreignKey:VirtualKeyID" json:"-"`                  // Linked VK identity (server-only, not serialized)
-	UserID           *string          `gorm:"type:varchar(255);index" json:"user_id"`            // Linked enterprise user identity (set when user ID is present)
+	UserID           *string          `gorm:"type:varchar(255);index" json:"user_id"`            // Linked enterprise user identity (set when user ID is present, or stamped at OAuth completion for deferred-fill user-mode flows)
+	AuthMode         string           `gorm:"type:varchar(20);not null" json:"auth_mode"`        // 'user' | 'vk' | 'none' — mirrors the flow's mode; immutable after creation
 	ExpiresAt        time.Time        `gorm:"index;not null" json:"expires_at"`
 	EncryptionStatus string           `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
 	CreatedAt        time.Time        `gorm:"index;not null" json:"created_at"`
