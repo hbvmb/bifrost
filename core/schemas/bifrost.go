@@ -164,22 +164,22 @@ const (
 // BifrostContextKey is a type for context keys used in Bifrost.
 type BifrostContextKey string
 
-// AuthMode describes which identity dimension a per-user OAuth row is keyed by.
+// MCPAuthMode describes which identity dimension a per-user OAuth row is keyed by.
 // It is a derived view of context state at the point of token lookup, never
-// stored as a context key. Derived via BifrostContext.AuthMode().
-type AuthMode string
+// stored as a context key. Derived via BifrostContext.MCPAuthMode().
+type MCPAuthMode string
 
 const (
-	// AuthModeUser: identity is a user id populated by an upstream auth
+	// MCPAuthModeUser: identity is a user id populated by an upstream auth
 	// middleware or plugin. Token rows keyed by user_id.
-	AuthModeUser AuthMode = "user"
-	// AuthModeVK: identity is a virtual key. Token rows keyed by vk_id.
-	AuthModeVK AuthMode = "vk"
-	// AuthModeSession: identity is a client-issued opaque session ID, asserted
-	// via the x-bf-mcp-session-id header. Token rows keyed by session_token_hash.
+	MCPAuthModeUser MCPAuthMode = "user"
+	// MCPAuthModeVK: identity is a virtual key. Token rows keyed by vk_id.
+	MCPAuthModeVK MCPAuthMode = "vk"
+	// MCPAuthModeSession: identity is a client-issued opaque session ID, asserted
+	// via the x-bf-mcp-session-id header. Token rows keyed by session_id.
 	// Used when there's no VK or user; the caller owns the session ID and must
 	// present it on every subsequent request to use the bound OAuth token.
-	AuthModeSession AuthMode = "session"
+	MCPAuthModeSession MCPAuthMode = "session"
 )
 
 // BifrostContextKeyRequestType is a context key for the request type.
@@ -240,7 +240,6 @@ const (
 	BifrostContextKeyTraceCompleter                      BifrostContextKey = "bifrost-trace-completer"                          // func([]PluginLogEntry) (callback to complete trace after streaming, receives transport plugin logs - set by tracing middleware)
 	BifrostContextKeyAccumulatorID                       BifrostContextKey = "bifrost-accumulator-id"                           // string (ID for streaming accumulator lookup - set by tracer for accumulator operations)
 	BifrostContextKeyMCPSessionID                        BifrostContextKey = "bifrost-mcp-session-id"                           // string (session-mode identity: any opaque value asserted by the caller via x-bf-mcp-session-id; binds the OAuth token row to subsequent /mcp calls when no VK or user is present)
-	BifrostContextKeyMCPUserID                           BifrostContextKey = "bifrost-mcp-user-id"                              // string (per-user OAuth user identifier from X-Bf-User-Id header)
 	BifrostContextKeyOAuthRedirectURI                    BifrostContextKey = "bifrost-oauth-redirect-uri"                       // string (OAuth callback URL, e.g. https://host/api/oauth/callback - set by HTTP middleware)
 	BifrostContextKeyIsMCPGateway                        BifrostContextKey = "bifrost-is-mcp-gateway"                           // bool (true when request is being handled via the MCP gateway path)
 	BifrostContextKeyHasEmittedMessageDelta              BifrostContextKey = "bifrost-has-emitted-message-delta"                // bool (tracks whether message_delta was already emitted during streaming - avoids duplicates)

@@ -235,19 +235,13 @@ func (r *BudgetResolver) isModelRequired(requestType schemas.RequestType) bool {
 // EvaluateVirtualKeyRequest evaluates virtual key-specific checks including validation, filtering, rate limits, and budgets
 // skipRateLimitsAndBudgets evaluates to true when we want to skip rate limits and budgets. This is used when user auth is present (user governance handles limits).
 func (r *BudgetResolver) EvaluateVirtualKeyRequest(ctx *schemas.BifrostContext, virtualKeyValue string, provider schemas.ModelProvider, model string, requestType schemas.RequestType, skipRateLimitsAndBudgets bool) *EvaluationResult {
-	if r.logger != nil {
-	}
 	// 1. Validate virtual key exists and is active
 	vk, exists := r.store.GetVirtualKey(ctx, virtualKeyValue)
 	if !exists {
-		if r.logger != nil {
-		}
 		return &EvaluationResult{
 			Decision: DecisionVirtualKeyNotFound,
 			Reason:   "Virtual key not found",
 		}
-	}
-	if r.logger != nil {
 	}
 	// Set virtual key id and name in context
 	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, vk.ID)

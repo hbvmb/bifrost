@@ -1185,7 +1185,7 @@ func (m *MockConfigStore) ClaimOauthUserSessionByState(ctx context.Context, stat
 	return nil, nil
 }
 
-func (m *MockConfigStore) GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserSession, error) {
+func (m *MockConfigStore) GetOauthUserSessionByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableOauthUserSession, error) {
 	return nil, nil
 }
 
@@ -1202,11 +1202,7 @@ func (m *MockConfigStore) UpdateOauthUserSession(ctx context.Context, session *t
 }
 
 // Per-user OAuth token CRUD
-func (m *MockConfigStore) GetOauthUserTokenByIdentity(ctx context.Context, virtualKeyID, userID, sessionToken, mcpClientID string) (*tables.TableOauthUserToken, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error) {
+func (m *MockConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableOauthUserToken, error) {
 	return nil, nil
 }
 
@@ -1226,7 +1222,7 @@ func (m *MockConfigStore) DeleteOauthUserToken(ctx context.Context, id string) e
 	return nil
 }
 
-func (m *MockConfigStore) DeleteOauthUserSessionsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.AuthMode, identity, mcpClientID string) error {
+func (m *MockConfigStore) DeleteOauthUserSessionsByModeIdentityAndMCPClient(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) error {
 	return nil
 }
 
@@ -1258,11 +1254,11 @@ func (m *MockConfigStore) GetOauthUserTokenByID(ctx context.Context, id string) 
 	return nil, nil
 }
 
-func (m *MockConfigStore) ListOauthUserTokensByMode(ctx context.Context, mode schemas.AuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error) {
+func (m *MockConfigStore) ListOauthUserTokensByMode(ctx context.Context, mode schemas.MCPAuthMode, identity string, includeOrphaned bool) ([]tables.TableOauthUserToken, error) {
 	return nil, nil
 }
 
-func (m *MockConfigStore) ListOauthUserSessionsByMode(ctx context.Context, mode schemas.AuthMode, identity string) ([]tables.TableOauthUserSession, error) {
+func (m *MockConfigStore) ListOauthUserSessionsByMode(ctx context.Context, mode schemas.MCPAuthMode, identity string) ([]tables.TableOauthUserSession, error) {
 	return nil, nil
 }
 
@@ -1280,75 +1276,6 @@ func (m *MockConfigStore) DeleteExpiredOauthUserSessions(ctx context.Context) (i
 
 func (m *MockConfigStore) DeleteOrphanedOauthUserTokens(ctx context.Context, olderThan time.Duration) (int64, error) {
 	return 0, nil
-}
-
-// Per-user OAuth Authorization Server CRUD
-func (m *MockConfigStore) GetPerUserOAuthClientByClientID(ctx context.Context, clientID string) (*tables.TablePerUserOAuthClient, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) CreatePerUserOAuthClient(ctx context.Context, client *tables.TablePerUserOAuthClient) error {
-	return nil
-}
-
-func (m *MockConfigStore) GetPerUserOAuthSessionByAccessToken(ctx context.Context, accessToken string) (*tables.TablePerUserOAuthSession, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) GetPerUserOAuthSessionByID(ctx context.Context, id string) (*tables.TablePerUserOAuthSession, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) CreatePerUserOAuthSession(ctx context.Context, session *tables.TablePerUserOAuthSession) error {
-	return nil
-}
-
-func (m *MockConfigStore) UpdatePerUserOAuthSession(ctx context.Context, session *tables.TablePerUserOAuthSession) error {
-	return nil
-}
-
-func (m *MockConfigStore) DeletePerUserOAuthSession(ctx context.Context, id string) error {
-	return nil
-}
-
-func (m *MockConfigStore) GetPerUserOAuthCodeByCode(ctx context.Context, code string) (*tables.TablePerUserOAuthCode, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) ClaimPerUserOAuthCode(ctx context.Context, code string) (*tables.TablePerUserOAuthCode, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) CreatePerUserOAuthCode(ctx context.Context, code *tables.TablePerUserOAuthCode) error {
-	return nil
-}
-
-func (m *MockConfigStore) UpdatePerUserOAuthCode(ctx context.Context, code *tables.TablePerUserOAuthCode) error {
-	return nil
-}
-
-func (m *MockConfigStore) GetPerUserOAuthPendingFlow(ctx context.Context, id string) (*tables.TablePerUserOAuthPendingFlow, error) {
-	return nil, nil
-}
-
-func (m *MockConfigStore) CreatePerUserOAuthPendingFlow(ctx context.Context, flow *tables.TablePerUserOAuthPendingFlow) error {
-	return nil
-}
-
-func (m *MockConfigStore) UpdatePerUserOAuthPendingFlow(ctx context.Context, flow *tables.TablePerUserOAuthPendingFlow) error {
-	return nil
-}
-
-func (m *MockConfigStore) DeletePerUserOAuthPendingFlow(ctx context.Context, id string) error {
-	return nil
-}
-
-func (m *MockConfigStore) ConsumePerUserOAuthPendingFlow(ctx context.Context, id string) (int64, error) {
-	return 1, nil
-}
-
-func (m *MockConfigStore) FinalizePerUserOAuthConsent(ctx context.Context, flowID string, session *tables.TablePerUserOAuthSession, code *tables.TablePerUserOAuthCode) (int64, error) {
-	return 1, nil
 }
 
 // Routing rules

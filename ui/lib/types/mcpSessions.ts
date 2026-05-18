@@ -57,8 +57,13 @@ export interface MCPFlowDetail {
 	oauth_config_id: string;
 	user_id?: string | null;
 	virtual_key?: VirtualKeySummary | null;
+	session_id?: string | null;
 	expires_at: string;
 	created_at: string;
+	// True when an active token already exists for this binding. Combined with
+	// status='pending' it means OAuth was re-initiated unnecessarily — the
+	// auth page should treat it as already authenticated.
+	has_active_token?: boolean;
 }
 
 export interface MCPFlowStartResponse {

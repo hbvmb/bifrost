@@ -609,11 +609,6 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 	})
 	bifrostCtx.SetValue(schemas.BifrostContextKeyRequestHeaders, allHeaders)
 
-	// Extract per-user MCP OAuth user identifier from X-Bf-User-Id header
-	if mcpUserID := string(ctx.Request.Header.Peek("X-Bf-User-Id")); mcpUserID != "" {
-		bifrostCtx.SetValue(schemas.BifrostContextKeyMCPUserID, mcpUserID)
-	}
-
 	// Build and set OAuth redirect URI for per-user OAuth flows. Bifrost is acting as
 	// the OAuth client to upstream MCP servers here, so use the client-side override.
 	var externalClientURL string

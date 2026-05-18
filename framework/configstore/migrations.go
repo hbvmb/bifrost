@@ -746,6 +746,12 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationReplaceOauthSessionTokenWithSessionID(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationDropLegacyOAuthServerTables(ctx, db); err != nil {
+		return err
+	}
+	if err := migrationDropMCPExternalServerURL(ctx, db); err != nil {
+		return err
+	}
 	if err := migrationAddTeamCalendarAlignedColumn(ctx, db); err != nil {
 		return err
 	}
@@ -6712,21 +6718,6 @@ func migrationAddPerUserOAuthTables(ctx context.Context, db *gorm.DB) error {
 		Migrate: func(tx *gorm.DB) error {
 			tx = tx.WithContext(ctx)
 			mg := tx.Migrator()
-			if !mg.HasTable(&tables.TablePerUserOAuthClient{}) {
-				if err := mg.CreateTable(&tables.TablePerUserOAuthClient{}); err != nil {
-					return fmt.Errorf("failed to create oauth_per_user_clients table: %w", err)
-				}
-			}
-			if !mg.HasTable(&tables.TablePerUserOAuthSession{}) {
-				if err := mg.CreateTable(&tables.TablePerUserOAuthSession{}); err != nil {
-					return fmt.Errorf("failed to create oauth_per_user_sessions table: %w", err)
-				}
-			}
-			if !mg.HasTable(&tables.TablePerUserOAuthCode{}) {
-				if err := mg.CreateTable(&tables.TablePerUserOAuthCode{}); err != nil {
-					return fmt.Errorf("failed to create oauth_per_user_codes table: %w", err)
-				}
-			}
 			if !mg.HasTable(&tables.TableOauthUserToken{}) {
 				if err := mg.CreateTable(&tables.TableOauthUserToken{}); err != nil {
 					return fmt.Errorf("failed to create oauth_user_tokens table: %w", err)
@@ -6737,11 +6728,6 @@ func migrationAddPerUserOAuthTables(ctx context.Context, db *gorm.DB) error {
 					return fmt.Errorf("failed to create oauth_user_sessions table: %w", err)
 				}
 			}
-			if !mg.HasTable(&tables.TablePerUserOAuthPendingFlow{}) {
-				if err := mg.CreateTable(&tables.TablePerUserOAuthPendingFlow{}); err != nil {
-					return fmt.Errorf("failed to create oauth_per_user_pending_flows table: %w", err)
-				}
-			}
 
 			return nil
 		},
@@ -6749,10 +6735,6 @@ func migrationAddPerUserOAuthTables(ctx context.Context, db *gorm.DB) error {
 			tx = tx.WithContext(ctx)
 			mg := tx.Migrator()
 			for _, table := range []any{
-				&tables.TablePerUserOAuthPendingFlow{},
-				&tables.TablePerUserOAuthCode{},
-				&tables.TablePerUserOAuthSession{},
-				&tables.TablePerUserOAuthClient{},
 				&tables.TableOauthUserToken{},
 				&tables.TableOauthUserSession{},
 			} {
@@ -7602,17 +7584,40 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 					}
 				}
 				// Backfill auth_mode from whichever identity column is populated.
-				// Priority: user_id > virtual_key_id > session_token_hash. Rows with
-				// none of these are legacy/anomalous and stay at the column default ('vk').
-				if err := tx.Exec(`
-					UPDATE oauth_user_tokens
-					SET auth_mode = CASE
-						WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
-						WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
-						WHEN session_token_hash IS NOT NULL AND session_token_hash != '' THEN 'none'
-						ELSE 'vk'
-					END
-				`).Error; err != nil {
+				// Priority: user_id > virtual_key_id > session column. The session
+				// column was renamed in a later migration (session_token_hash →
+				// session_id), so the SQL has to adapt: a fresh DB starts on the
+				// new schema and never had session_token_hash; an existing DB
+				// hasn't been through the rename yet and still has it.
+				sessionCol := ""
+				switch {
+				case mg.HasColumn(&tables.TableOauthUserToken{}, "session_token_hash"):
+					sessionCol = "session_token_hash"
+				case mg.HasColumn(&tables.TableOauthUserToken{}, "session_id"):
+					sessionCol = "session_id"
+				}
+				var backfillSQL string
+				if sessionCol != "" {
+					backfillSQL = `
+						UPDATE oauth_user_tokens
+						SET auth_mode = CASE
+							WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
+							WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
+							WHEN ` + sessionCol + ` IS NOT NULL AND ` + sessionCol + ` != '' THEN 'session'
+							ELSE 'vk'
+						END
+					`
+				} else {
+					backfillSQL = `
+						UPDATE oauth_user_tokens
+						SET auth_mode = CASE
+							WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
+							WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
+							ELSE 'vk'
+						END
+					`
+				}
+				if err := tx.Exec(backfillSQL).Error; err != nil {
 					return fmt.Errorf("backfill oauth_user_tokens.auth_mode: %w", err)
 				}
 				// Ensure status is populated for legacy rows.
@@ -7633,7 +7638,10 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 				}
 
 				// Partial unique indexes (one per identity dimension). Both Postgres
-				// and SQLite (3.8+) support WHERE on indexes.
+				// and SQLite (3.8+) support WHERE on indexes. Use whichever session
+				// column exists on this DB (legacy session_token_hash vs renamed
+				// session_id); migrationReplaceOauthSessionTokenWithSessionID later
+				// drops + recreates the session index on session_id anyway.
 				partialUniques := []string{
 					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_user_mcp
 						ON oauth_user_tokens (user_id, mcp_client_id)
@@ -7641,9 +7649,13 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_vk_mcp
 						ON oauth_user_tokens (virtual_key_id, mcp_client_id)
 						WHERE virtual_key_id IS NOT NULL`,
-					`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_session_mcp
-						ON oauth_user_tokens (session_token_hash, mcp_client_id)
-						WHERE session_token_hash IS NOT NULL AND session_token_hash != ''`,
+				}
+				if sessionCol != "" {
+					partialUniques = append(partialUniques,
+						`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_user_tokens_session_mcp
+							ON oauth_user_tokens (`+sessionCol+`, mcp_client_id)
+							WHERE `+sessionCol+` IS NOT NULL AND `+sessionCol+` != ''`,
+					)
 				}
 				for _, stmt := range partialUniques {
 					if err := tx.Exec(stmt).Error; err != nil {
@@ -7677,25 +7689,6 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 					END
 				`).Error; err != nil {
 					return fmt.Errorf("backfill oauth_user_sessions.flow_mode: %w", err)
-				}
-			}
-
-			// 3) oauth_per_user_sessions: add auth_mode (user_id already exists)
-			if mg.HasTable(&tables.TablePerUserOAuthSession{}) {
-				if !mg.HasColumn(&tables.TablePerUserOAuthSession{}, "auth_mode") {
-					if err := mg.AddColumn(&tables.TablePerUserOAuthSession{}, "AuthMode"); err != nil {
-						return fmt.Errorf("add auth_mode to oauth_per_user_sessions: %w", err)
-					}
-				}
-				if err := tx.Exec(`
-					UPDATE oauth_per_user_sessions
-					SET auth_mode = CASE
-						WHEN user_id IS NOT NULL AND user_id != '' THEN 'user'
-						WHEN virtual_key_id IS NOT NULL AND virtual_key_id != '' THEN 'vk'
-						ELSE 'none'
-					END
-				`).Error; err != nil {
-					return fmt.Errorf("backfill oauth_per_user_sessions.auth_mode: %w", err)
 				}
 			}
 
@@ -7734,9 +7727,6 @@ func migrationAddOAuthAuthModeColumns(ctx context.Context, db *gorm.DB) error {
 			}
 			if mg.HasTable(&tables.TableOauthUserSession{}) && mg.HasColumn(&tables.TableOauthUserSession{}, "flow_mode") {
 				_ = mg.DropColumn(&tables.TableOauthUserSession{}, "FlowMode")
-			}
-			if mg.HasTable(&tables.TablePerUserOAuthSession{}) && mg.HasColumn(&tables.TablePerUserOAuthSession{}, "auth_mode") {
-				_ = mg.DropColumn(&tables.TablePerUserOAuthSession{}, "AuthMode")
 			}
 
 			return nil
@@ -7860,6 +7850,105 @@ func migrationReplaceOauthSessionTokenWithSessionID(ctx context.Context, db *gor
 				}
 			}
 
+			return nil
+		},
+	})
+}
+
+// migrationDropLegacyOAuthServerTables drops the four tables that backed the
+// MCP-gateway-OAuth-server flow (Bifrost acting as an OAuth Authorization
+// Server to upstream MCP clients), plus the gateway_session_id column on
+// oauth_user_sessions that linked them. Bifrost is now strictly an OAuth
+// *client* to upstream providers; the server-side flow was replaced by the
+// x-bf-mcp-session-id header model (see migrationReplaceOauthSessionTokenWithSessionID).
+//
+// Tables removed:
+//   - oauth_per_user_clients       (dynamic client registration)
+//   - oauth_per_user_sessions      (Bifrost-issued bearer tokens for MCP clients)
+//   - oauth_per_user_codes         (authorization codes)
+//   - oauth_per_user_pending_flows (in-flight consent state)
+//
+// No data preservation needed: the flow that wrote these rows no longer exists
+// in the code, so any rows present are orphans referring to a removed code path.
+// Rollback recreates the tables empty (best-effort schema-only; original data
+// is gone).
+func migrationDropLegacyOAuthServerTables(ctx context.Context, db *gorm.DB) error {
+	return RunSingleMigration(ctx, db, &migrator.Migration{
+		ID: "drop_legacy_oauth_server_tables",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+
+			// Drop the gateway_session_id column on oauth_user_sessions first,
+			// since the table dropped below (oauth_per_user_sessions) was its
+			// logical pairing. DROP COLUMN with IF EXISTS is supported by
+			// Postgres but not SQLite — fall back to checking via Migrator.
+			mg := tx.Migrator()
+			if mg.HasTable("oauth_user_sessions") && mg.HasColumn("oauth_user_sessions", "gateway_session_id") {
+				if err := tx.Exec("ALTER TABLE oauth_user_sessions DROP COLUMN gateway_session_id").Error; err != nil {
+					return fmt.Errorf("drop gateway_session_id from oauth_user_sessions: %w", err)
+				}
+			}
+
+			for _, table := range []string{
+				"oauth_per_user_codes",
+				"oauth_per_user_pending_flows",
+				"oauth_per_user_sessions",
+				"oauth_per_user_clients",
+			} {
+				if err := tx.Exec("DROP TABLE IF EXISTS " + table).Error; err != nil {
+					return fmt.Errorf("drop %s: %w", table, err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			// Best-effort schema-only rollback: re-add gateway_session_id and
+			// recreate empty tables with minimal columns. Original schema and
+			// data aren't recoverable; this is to unblock a rollback test, not
+			// to restore a working consent flow.
+			_ = tx.Exec("ALTER TABLE oauth_user_sessions ADD COLUMN gateway_session_id VARCHAR(255)").Error
+			for _, ddl := range []string{
+				"CREATE TABLE IF NOT EXISTS oauth_per_user_clients (id VARCHAR(255) PRIMARY KEY)",
+				"CREATE TABLE IF NOT EXISTS oauth_per_user_sessions (id VARCHAR(255) PRIMARY KEY)",
+				"CREATE TABLE IF NOT EXISTS oauth_per_user_codes (id VARCHAR(255) PRIMARY KEY)",
+				"CREATE TABLE IF NOT EXISTS oauth_per_user_pending_flows (id VARCHAR(255) PRIMARY KEY)",
+			} {
+				if err := tx.Exec(ddl).Error; err != nil {
+					return fmt.Errorf("recreate legacy table: %w", err)
+				}
+			}
+			return nil
+		},
+	})
+}
+
+// migrationDropMCPExternalServerURL drops the mcp_external_server_url column
+// from config_client. This URL was used to advertise Bifrost as an OAuth
+// authorization server (.well-known endpoints, WWW-Authenticate header on
+// /mcp). Bifrost no longer acts as an OAuth server (see
+// migrationDropLegacyOAuthServerTables), so the column is dead.
+//
+// The companion mcp_external_client_url column is retained — it's still used
+// as the redirect_uri base when Bifrost acts as an OAuth *client* to upstream
+// MCP servers.
+func migrationDropMCPExternalServerURL(ctx context.Context, db *gorm.DB) error {
+	return RunSingleMigration(ctx, db, &migrator.Migration{
+		ID: "drop_mcp_external_server_url_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+			if mg.HasTable("config_client") && mg.HasColumn("config_client", "mcp_external_server_url") {
+				if err := tx.Exec("ALTER TABLE config_client DROP COLUMN mcp_external_server_url").Error; err != nil {
+					return fmt.Errorf("drop mcp_external_server_url from config_client: %w", err)
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			// Best-effort: re-add the column (empty values; no data to restore).
+			_ = tx.Exec("ALTER TABLE config_client ADD COLUMN mcp_external_server_url VARCHAR(512)").Error
 			return nil
 		},
 	})

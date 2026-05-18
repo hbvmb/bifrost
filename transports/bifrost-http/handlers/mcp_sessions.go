@@ -135,16 +135,16 @@ type sessionBindingKey struct {
 
 func bindingKeyFromToken(t tables.TableOauthUserToken) sessionBindingKey {
 	k := sessionBindingKey{Mode: t.AuthMode, MCPClientID: t.MCPClientID}
-	switch schemas.AuthMode(t.AuthMode) {
-	case schemas.AuthModeUser:
+	switch schemas.MCPAuthMode(t.AuthMode) {
+	case schemas.MCPAuthModeUser:
 		if t.UserID != nil {
 			k.Identity = *t.UserID
 		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if t.VirtualKeyID != nil {
 			k.Identity = *t.VirtualKeyID
 		}
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		k.Identity = t.SessionID
 	}
 	return k
@@ -152,16 +152,16 @@ func bindingKeyFromToken(t tables.TableOauthUserToken) sessionBindingKey {
 
 func bindingKeyFromFlow(f tables.TableOauthUserSession) sessionBindingKey {
 	k := sessionBindingKey{Mode: f.FlowMode, MCPClientID: f.MCPClientID}
-	switch schemas.AuthMode(f.FlowMode) {
-	case schemas.AuthModeUser:
+	switch schemas.MCPAuthMode(f.FlowMode) {
+	case schemas.MCPAuthModeUser:
 		if f.UserID != nil {
 			k.Identity = *f.UserID
 		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if f.VirtualKeyID != nil {
 			k.Identity = *f.VirtualKeyID
 		}
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		k.Identity = f.SessionID
 	}
 	return k
@@ -188,17 +188,17 @@ func (h *MCPSessionsHandler) reauth(ctx *fasthttp.RequestCtx) {
 	// The new flow must reuse the existing row's identity so the callback's
 	// upsert lands on the same (identity, mcp_client) row. Inject the row's
 	// values into context; InitiateUserOAuthFlow reads them per-mode.
-	rowMode := schemas.AuthMode(tok.AuthMode)
+	rowMode := schemas.MCPAuthMode(tok.AuthMode)
 	switch rowMode {
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		if tok.SessionID != "" {
 			bfCtx.SetValue(schemas.BifrostContextKeyMCPSessionID, tok.SessionID)
 		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if tok.VirtualKeyID != nil && *tok.VirtualKeyID != "" {
 			bfCtx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, *tok.VirtualKeyID)
 		}
-	case schemas.AuthModeUser:
+	case schemas.MCPAuthModeUser:
 		if tok.UserID != nil && *tok.UserID != "" {
 			bfCtx.SetValue(schemas.BifrostContextKeyUserID, *tok.UserID)
 		}
@@ -242,14 +242,6 @@ func (h *MCPSessionsHandler) revoke(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Best-effort upstream revoke via the session token (which keys the
-	// RefreshUserAccessToken / RevokeUserToken path).
-	if tok.SessionID != "" {
-		if revokeErr := h.store.OAuthProvider.RevokeUserToken(ctx, tok.SessionID); revokeErr != nil {
-			logger.Warn("[mcp/sessions] upstream revoke failed (continuing with row delete): token=%s err=%v", rowID, revokeErr)
-		}
-	}
-
 	if err := h.store.ConfigStore.DeleteOauthUserToken(ctx, tok.ID); err != nil {
 		logger.Error("[mcp/sessions] delete row failed: token=%s err=%v", rowID, err)
 		SendError(ctx, fasthttp.StatusInternalServerError, "Failed to delete MCP session")
@@ -278,8 +270,15 @@ type mcpFlowDetailResponse struct {
 	OauthConfigID string             `json:"oauth_config_id"`
 	UserID        *string            `json:"user_id,omitempty"`
 	VirtualKey    *virtualKeySummary `json:"virtual_key,omitempty"`
+	SessionID     *string            `json:"session_id,omitempty"`
 	ExpiresAt     string             `json:"expires_at"`
 	CreatedAt     string             `json:"created_at"`
+	// HasActiveToken is true when an active token already exists for the
+	// flow's (mode, identity, mcp_client) binding. A pending flow with this
+	// set means the user re-initiated OAuth (or a stale caller did) on a
+	// binding that already has a working token — the auth page should treat
+	// it as "no auth needed" rather than prompting the user.
+	HasActiveToken bool `json:"has_active_token"`
 }
 
 // flowDetail returns the pending flow row's metadata so the frontend sessions
@@ -321,6 +320,34 @@ func (h *MCPSessionsHandler) flowDetail(ctx *fasthttp.RequestCtx) {
 		resp.VirtualKey = &virtualKeySummary{ID: flow.VirtualKey.ID, Name: flow.VirtualKey.Name}
 	} else if flow.VirtualKeyID != nil {
 		resp.VirtualKey = &virtualKeySummary{ID: *flow.VirtualKeyID}
+	}
+	if flow.FlowMode == string(schemas.MCPAuthModeSession) && flow.SessionID != "" {
+		sid := flow.SessionID
+		resp.SessionID = &sid
+	}
+	// Check whether an active token already exists for this binding. A pending
+	// flow on top of a working token means OAuth was re-initiated for some
+	// reason; the auth page should display this as "already authenticated"
+	// rather than prompt the user to authenticate again.
+	if flowMode := schemas.MCPAuthMode(flow.FlowMode); flowMode != "" {
+		identity := ""
+		switch flowMode {
+		case schemas.MCPAuthModeUser:
+			if flow.UserID != nil {
+				identity = *flow.UserID
+			}
+		case schemas.MCPAuthModeVK:
+			if flow.VirtualKeyID != nil {
+				identity = *flow.VirtualKeyID
+			}
+		case schemas.MCPAuthModeSession:
+			identity = flow.SessionID
+		}
+		if identity != "" {
+			if tok, lookupErr := h.store.ConfigStore.GetOauthUserTokenByMode(ctx, flowMode, identity, flow.MCPClientID); lookupErr == nil && tok != nil {
+				resp.HasActiveToken = true
+			}
+		}
 	}
 	SendJSON(ctx, resp)
 }
@@ -392,13 +419,13 @@ func (h *MCPSessionsHandler) loadAuthorizedFlow(ctx *fasthttp.RequestCtx, bfCtx 
 //   - user-mode pre-populated: only the same user can complete.
 //   - user-mode deferred-fill: any authenticated user may complete; their
 //     identity stamps the row at completion time.
-func flowAllowsCaller(flow *tables.TableOauthUserSession, mode schemas.AuthMode, identity string) bool {
-	flowMode := schemas.AuthMode(flow.FlowMode)
+func flowAllowsCaller(flow *tables.TableOauthUserSession, mode schemas.MCPAuthMode, identity string) bool {
+	flowMode := schemas.MCPAuthMode(flow.FlowMode)
 	switch flowMode {
-	case schemas.AuthModeVK, schemas.AuthModeSession:
+	case schemas.MCPAuthModeVK, schemas.MCPAuthModeSession:
 		return true
-	case schemas.AuthModeUser:
-		if mode != schemas.AuthModeUser {
+	case schemas.MCPAuthModeUser:
+		if mode != schemas.MCPAuthModeUser {
 			return false
 		}
 		if flow.UserID == nil || *flow.UserID == "" {
@@ -412,20 +439,20 @@ func flowAllowsCaller(flow *tables.TableOauthUserSession, mode schemas.AuthMode,
 // identityFromTokenRow returns the (mode, identity) pair recorded on the row.
 // Inverse of the mode/identity routing used when creating the row; the row's
 // AuthMode column is the source of truth for which identity column is keyed.
-func identityFromTokenRow(tok *tables.TableOauthUserToken) (schemas.AuthMode, string) {
-	switch schemas.AuthMode(tok.AuthMode) {
-	case schemas.AuthModeUser:
+func identityFromTokenRow(tok *tables.TableOauthUserToken) (schemas.MCPAuthMode, string) {
+	switch schemas.MCPAuthMode(tok.AuthMode) {
+	case schemas.MCPAuthModeUser:
 		if tok.UserID != nil {
-			return schemas.AuthModeUser, *tok.UserID
+			return schemas.MCPAuthModeUser, *tok.UserID
 		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if tok.VirtualKeyID != nil {
-			return schemas.AuthModeVK, *tok.VirtualKeyID
+			return schemas.MCPAuthModeVK, *tok.VirtualKeyID
 		}
-	case schemas.AuthModeSession:
-		return schemas.AuthModeSession, tok.SessionID
+	case schemas.MCPAuthModeSession:
+		return schemas.MCPAuthModeSession, tok.SessionID
 	}
-	return schemas.AuthMode(tok.AuthMode), ""
+	return schemas.MCPAuthMode(tok.AuthMode), ""
 }
 
 // loadRowAuthorizedForCaller loads a token row and applies the same
@@ -453,7 +480,7 @@ func (h *MCPSessionsHandler) loadRowAuthorizedForCaller(ctx *fasthttp.RequestCtx
 // loadAuthorizedToken looks up the row and verifies the caller's identity
 // matches. Writes the appropriate HTTP error response on failure and returns
 // a sentinel error so callers can early-return.
-func (h *MCPSessionsHandler) loadAuthorizedToken(ctx *fasthttp.RequestCtx, rowID string, mode schemas.AuthMode, identity string) (*tables.TableOauthUserToken, error) {
+func (h *MCPSessionsHandler) loadAuthorizedToken(ctx *fasthttp.RequestCtx, rowID string, mode schemas.MCPAuthMode, identity string) (*tables.TableOauthUserToken, error) {
 	tok, err := h.store.ConfigStore.GetOauthUserTokenByID(ctx, rowID)
 	if err != nil {
 		logger.Error("[mcp/sessions] load row failed: token=%s err=%v", rowID, err)
@@ -486,13 +513,13 @@ func (e errSentinel) Error() string { return string(e) }
 // given mode equals the caller's identity. For AuthModeSession the comparison
 // is between the caller's session token (raw) and the row's hash, matching
 // what the resolver does on lookup.
-func rowMatchesIdentity(tok *tables.TableOauthUserToken, mode schemas.AuthMode, identity string) bool {
+func rowMatchesIdentity(tok *tables.TableOauthUserToken, mode schemas.MCPAuthMode, identity string) bool {
 	switch mode {
-	case schemas.AuthModeUser:
+	case schemas.MCPAuthModeUser:
 		return tok.UserID != nil && *tok.UserID == identity
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		return tok.VirtualKeyID != nil && *tok.VirtualKeyID == identity
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		return tok.SessionID != "" && tok.SessionID == identity
 	}
 	return false
@@ -502,22 +529,18 @@ func rowMatchesIdentity(tok *tables.TableOauthUserToken, mode schemas.AuthMode, 
 // string for the matching dimension. Mirrors identityForMode in core/mcp/utils
 // — kept local because importing across handler→core for this small helper
 // would be circular.
-func callerModeAndIdentity(bfCtx *schemas.BifrostContext) (schemas.AuthMode, string) {
-	mode := bfCtx.AuthMode()
+func callerModeAndIdentity(bfCtx *schemas.BifrostContext) (schemas.MCPAuthMode, string) {
+	mode := bfCtx.MCPAuthMode()
 	switch mode {
-	case schemas.AuthModeUser:
+	case schemas.MCPAuthModeUser:
 		if v := bifrost.GetStringFromContext(bfCtx, schemas.BifrostContextKeyUserID); v != "" {
 			return mode, v
 		}
-		// Legacy X-Bf-User-Id back-compat.
-		if v := bifrost.GetStringFromContext(bfCtx, schemas.BifrostContextKeyMCPUserID); v != "" {
-			return mode, v
-		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if v := bifrost.GetStringFromContext(bfCtx, schemas.BifrostContextKeyGovernanceVirtualKeyID); v != "" {
 			return mode, v
 		}
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		if v := bifrost.GetStringFromContext(bfCtx, schemas.BifrostContextKeyMCPSessionID); v != "" {
 			return mode, v
 		}
@@ -546,7 +569,7 @@ func tokenRow(t tables.TableOauthUserToken) mcpSessionRow {
 	} else if t.VirtualKeyID != nil {
 		row.VirtualKey = &virtualKeySummary{ID: *t.VirtualKeyID}
 	}
-	if t.AuthMode == string(schemas.AuthModeSession) && t.SessionID != "" {
+	if t.AuthMode == string(schemas.MCPAuthModeSession) && t.SessionID != "" {
 		s := t.SessionID
 		row.SessionID = &s
 	}
@@ -584,7 +607,7 @@ func flowRow(f tables.TableOauthUserSession) mcpSessionRow {
 	} else if f.VirtualKeyID != nil {
 		row.VirtualKey = &virtualKeySummary{ID: *f.VirtualKeyID}
 	}
-	if f.FlowMode == string(schemas.AuthModeSession) && f.SessionID != "" {
+	if f.FlowMode == string(schemas.MCPAuthModeSession) && f.SessionID != "" {
 		s := f.SessionID
 		row.SessionID = &s
 	}

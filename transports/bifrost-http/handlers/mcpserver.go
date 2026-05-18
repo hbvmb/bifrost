@@ -86,6 +86,14 @@ func (h *MCPServerHandler) RegisterRoutes(r *router.Router, middlewares ...schem
 	// MCP server endpoint - supports both POST (JSON-RPC) and GET (SSE)
 	r.POST("/mcp", lib.ChainMiddlewares(h.handleMCPServer, middlewares...))
 	r.GET("/mcp", lib.ChainMiddlewares(h.handleMCPServerSSE, middlewares...))
+	// Bifrost is NOT an OAuth authorization server — auth is via the
+	// x-bf-vk / x-bf-mcp-session-id headers or upstream SSO. Claude Code's
+	// MCP client may proactively POST `/register` (RFC 7591 DCR) on
+	// `claude mcp add` and log "SDK auth failed: ..." when the probe fails,
+	// even though the underlying `/mcp` connection works fine. That warning
+	// is a known Claude Code bug — see
+	// https://github.com/anthropics/claude-code/issues/46640 — and is safe
+	// to ignore. We intentionally do NOT implement an OAuth stub.
 }
 
 func (h *MCPServerHandler) handleMCPServer(ctx *fasthttp.RequestCtx) {

@@ -21,43 +21,31 @@ type OAuth2Provider interface {
 
 	// Per-user OAuth methods
 
-	// GetUserAccessToken retrieves the access token for a per-user OAuth session.
-	// If the token is expired, it automatically attempts a refresh.
-	GetUserAccessToken(ctx context.Context, sessionToken string) (string, error)
-
-	// GetUserAccessTokenByIdentity retrieves the upstream access token for a user
-	// identified by virtualKeyID, userID, or sessionToken (fallback), for a specific
-	// MCP client. Tokens looked up by identity persist across sessions.
-	//
-	// Deprecated: use GetUserAccessTokenByMode. Retained only for the legacy
-	// server-rendered consent handler.
-	GetUserAccessTokenByIdentity(ctx context.Context, virtualKeyID, userID, sessionToken, mcpClientID string) (string, error)
-
 	// GetUserAccessTokenByMode retrieves the upstream access token for a single
 	// identity dimension determined by mode. No fallback chain — exactly one
 	// identity column is queried. Filters status='active' so orphaned rows never
-	// satisfy a lookup. identity is the user ID for AuthModeUser, the VK row ID
-	// for AuthModeVK, and the raw (unhashed) session token for AuthModeSession.
-	GetUserAccessTokenByMode(ctx context.Context, mode AuthMode, identity, mcpClientID string) (string, error)
+	// satisfy a lookup. identity is the user ID for MCPAuthModeUser, the VK row
+	// ID for MCPAuthModeVK, and the raw session ID for MCPAuthModeSession.
+	GetUserAccessTokenByMode(ctx context.Context, mode MCPAuthMode, identity, mcpClientID string) (string, error)
 
-	// InitiateUserOAuthFlow creates a per-user OAuth session and returns the
-	// authorization URL. flowMode tags the row's flow_mode and decides which
-	// identity column gets populated from context (UserID for AuthModeUser, the
-	// resolved VK row ID for AuthModeVK, neither for AuthModeSession). For
-	// AuthModeUser flows where no UserID is available in context yet (external
-	// MCP client OAuth init), the column is left NULL and stamped at completion.
-	// Returns (flow initiation details, session ID for polling, error).
-	InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string, flowMode AuthMode) (*OAuth2FlowInitiation, string, error)
+	// InitiateUserOAuthFlow creates or refreshes the per-user OAuth flow row
+	// for a (mode, identity, mcp_client) binding and returns the auth landing
+	// URL. flowMode tags the row's flow_mode and decides which identity column
+	// gets populated from context (UserID for MCPAuthModeUser, the resolved VK
+	// row ID for MCPAuthModeVK, the session ID for MCPAuthModeSession). For
+	// MCPAuthModeUser flows where no UserID is available in context yet
+	// (external MCP client OAuth init), the column is left NULL and stamped
+	// at completion. Returns (flow initiation details, flow row ID, error).
+	InitiateUserOAuthFlow(ctx context.Context, oauthConfigID string, mcpClientID string, redirectURI string, flowMode MCPAuthMode) (*OAuth2FlowInitiation, string, error)
 
 	// CompleteUserOAuthFlow handles the OAuth callback for a per-user flow.
-	// Returns the session token that the user should send on subsequent requests.
+	// Returns the SessionID stored on the flow row (populated for session-mode,
+	// empty otherwise).
 	CompleteUserOAuthFlow(ctx context.Context, state string, code string) (string, error)
 
-	// RefreshUserAccessToken refreshes a per-user OAuth access token.
-	RefreshUserAccessToken(ctx context.Context, sessionToken string) error
-
-	// RevokeUserToken revokes a per-user OAuth token and marks the session as revoked.
-	RevokeUserToken(ctx context.Context, sessionToken string) error
+	// RefreshUserAccessToken refreshes a per-user OAuth access token, looked up
+	// by the token row's primary-key ID.
+	RefreshUserAccessToken(ctx context.Context, tokenID string) error
 
 	// Cascade primitives. Identity-agnostic and mechanical — the caller decides
 	// the policy (e.g. "does this user still have another VK granting access to

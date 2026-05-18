@@ -163,8 +163,7 @@ type TableOauthUserSession struct {
 	State            string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"-"`         // CSRF state token sent to OAuth provider
 	RedirectURI      string    `gorm:"type:text" json:"-"`                                      // Per-request redirect URI used in authorize step
 	CodeVerifier     string    `gorm:"type:text" json:"-"`                                      // PKCE code verifier (kept secret)
-	SessionID        string    `gorm:"type:varchar(255);index" json:"-"`                        // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows. Stored plaintext (not a bearer credential; same trust model as a VK value).
-	GatewaySessionID string    `gorm:"type:varchar(255);index" json:"-"`                        // Bifrost MCP gateway session ID (legacy oauth-server flow; to be removed in OSS-4).
+	SessionID        string    `gorm:"type:varchar(255);index" json:"session_id,omitempty"`     // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows. Stored plaintext (not a bearer credential; same trust model as a VK value).
 	VirtualKeyID     *string   `gorm:"type:varchar(255);index" json:"virtual_key_id"`           // VK identity (propagated to oauth_user_tokens)
 	UserID           *string   `gorm:"type:varchar(255);index" json:"user_id"`                  // Enterprise user identity (propagated to oauth_user_tokens); nullable for deferred-fill user-mode flows
 	FlowMode         string    `gorm:"type:varchar(20);not null;default:'vk'" json:"flow_mode"` // 'user' | 'vk' | 'session' — mirrors the token row's AuthMode; immutable after creation
@@ -213,7 +212,7 @@ func (s *TableOauthUserSession) AfterFind(tx *gorm.DB) error {
 // per row; AuthMode records which one.
 type TableOauthUserToken struct {
 	ID               string     `gorm:"type:varchar(255);primaryKey" json:"id"`                   // Token UUID
-	SessionID        string     `gorm:"type:varchar(255);index" json:"-"`                         // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows.
+	SessionID        string     `gorm:"type:varchar(255);index" json:"session_id,omitempty"`      // Session-mode identity: client-asserted x-bf-mcp-session-id. Empty for vk/user mode rows.
 	VirtualKeyID     *string    `gorm:"type:varchar(255);index" json:"virtual_key_id"`            // VK identity (vk-mode rows)
 	UserID           *string    `gorm:"type:varchar(255);index" json:"user_id"`                   // User identity (user-mode rows; populated by enterprise middleware/governance)
 	MCPClientID      string     `gorm:"type:varchar(255);not null;index" json:"mcp_client_id"`    // Which MCP server
@@ -265,138 +264,4 @@ func (t *TableOauthUserToken) AfterFind(tx *gorm.DB) error {
 		}
 	}
 	return nil
-}
-
-// ---------- Per-User OAuth Authorization Server Tables ----------
-
-// TablePerUserOAuthClient stores dynamically registered OAuth clients (RFC 7591).
-// MCP clients (like Claude Code) register themselves with Bifrost's OAuth
-// authorization server to obtain a client_id for the authorization code flow.
-type TablePerUserOAuthClient struct {
-	ID           string    `gorm:"type:varchar(255);primaryKey" json:"id"`
-	ClientID     string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"client_id"`
-	ClientName   string    `gorm:"type:varchar(255)" json:"client_name"`
-	RedirectURIs string    `gorm:"type:text;not null" json:"redirect_uris"` // JSON array of allowed redirect URIs
-	GrantTypes   string    `gorm:"type:text" json:"grant_types"`            // JSON array of grant types
-	CreatedAt    time.Time `gorm:"index;not null" json:"created_at"`
-	UpdatedAt    time.Time `gorm:"index;not null" json:"updated_at"`
-}
-
-// TableName returns the table name for per-user OAuth clients.
-func (TablePerUserOAuthClient) TableName() string {
-	return "oauth_per_user_clients"
-}
-
-// TablePerUserOAuthSession stores Bifrost-issued access tokens for authenticated
-// MCP connections. When a user authenticates via Bifrost's OAuth flow, a session
-// is created. The access token is included in all subsequent MCP requests.
-// Upstream provider tokens are linked via the oauth_user_tokens table.
-type TablePerUserOAuthSession struct {
-	ID               string           `gorm:"type:varchar(255);primaryKey" json:"id"`
-	AccessToken      string           `gorm:"type:text;not null" json:"-"`                       // Bifrost-issued access token (encrypted)
-	AccessTokenHash  string           `gorm:"type:varchar(64);uniqueIndex" json:"-"`             // SHA-256 hash for secure lookups
-	RefreshToken     string           `gorm:"type:text" json:"-"`                                // Bifrost-issued refresh token (encrypted, optional)
-	RefreshTokenHash string           `gorm:"type:varchar(64);index" json:"-"`                   // SHA-256 hash for secure lookups (not unique — refresh tokens are optional)
-	ClientID         string           `gorm:"type:varchar(255);not null;index" json:"client_id"` // Which OAuth client registered this session
-	VirtualKeyID     *string          `gorm:"type:varchar(255);index" json:"virtual_key_id"`     // Linked VK identity (set when VK is present during auth)
-	VirtualKey       *TableVirtualKey `gorm:"foreignKey:VirtualKeyID" json:"-"`                  // Linked VK identity (server-only, not serialized)
-	UserID           *string          `gorm:"type:varchar(255);index" json:"user_id"`            // Linked enterprise user identity (set when user ID is present, or stamped at OAuth completion for deferred-fill user-mode flows)
-	AuthMode         string           `gorm:"type:varchar(20);not null" json:"auth_mode"`        // 'user' | 'vk' | 'session' — mirrors the flow's mode; immutable after creation
-	ExpiresAt        time.Time        `gorm:"index;not null" json:"expires_at"`
-	EncryptionStatus string           `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
-	CreatedAt        time.Time        `gorm:"index;not null" json:"created_at"`
-	UpdatedAt        time.Time        `gorm:"index;not null" json:"updated_at"`
-}
-
-// TableName returns the table name for per-user OAuth sessions.
-func (TablePerUserOAuthSession) TableName() string {
-	return "oauth_per_user_sessions"
-}
-
-// BeforeSave encrypts sensitive fields.
-func (s *TablePerUserOAuthSession) BeforeSave(tx *gorm.DB) error {
-	if s.AccessToken != "" {
-		s.AccessTokenHash = encrypt.HashSHA256(s.AccessToken)
-	}
-	if s.RefreshToken != "" {
-		s.RefreshTokenHash = encrypt.HashSHA256(s.RefreshToken)
-	}
-	if encrypt.IsEnabled() {
-		if err := encryptString(&s.AccessToken); err != nil {
-			return fmt.Errorf("failed to encrypt per-user oauth access token: %w", err)
-		}
-		if s.RefreshToken != "" {
-			if err := encryptString(&s.RefreshToken); err != nil {
-				return fmt.Errorf("failed to encrypt per-user oauth refresh token: %w", err)
-			}
-		}
-		s.EncryptionStatus = EncryptionStatusEncrypted
-	}
-	return nil
-}
-
-// AfterFind decrypts sensitive fields.
-func (s *TablePerUserOAuthSession) AfterFind(tx *gorm.DB) error {
-	if s.EncryptionStatus == EncryptionStatusEncrypted {
-		if err := decryptString(&s.AccessToken); err != nil {
-			return fmt.Errorf("failed to decrypt per-user oauth access token: %w", err)
-		}
-		if s.RefreshToken != "" {
-			if err := decryptString(&s.RefreshToken); err != nil {
-				return fmt.Errorf("failed to decrypt per-user oauth refresh token: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
-// TablePerUserOAuthCode stores authorization codes during the OAuth flow.
-// Codes are short-lived (5 minutes) and single-use.
-type TablePerUserOAuthCode struct {
-	ID            string    `gorm:"type:varchar(255);primaryKey" json:"id"`
-	Code          string    `gorm:"type:text;not null" json:"-"`           // Authorization code
-	CodeHash      string    `gorm:"type:varchar(64);uniqueIndex" json:"-"` // SHA-256 hash for secure lookups
-	ClientID      string    `gorm:"type:varchar(255);not null;index" json:"client_id"`
-	RedirectURI   string    `gorm:"type:text;not null" json:"redirect_uri"`
-	CodeChallenge string    `gorm:"type:varchar(255);not null" json:"-"` // PKCE S256 challenge
-	Scopes        string    `gorm:"type:text" json:"scopes"`             // JSON array of requested scopes
-	SessionID     string    `gorm:"type:varchar(255);index" json:"-"`    // Links to the TablePerUserOAuthSession created during consent submit
-	ExpiresAt     time.Time `gorm:"index;not null" json:"expires_at"`    // 5 min TTL
-	Used          bool      `gorm:"default:false;not null" json:"used"`  // Single-use flag
-	CreatedAt     time.Time `gorm:"index;not null" json:"created_at"`
-}
-
-// BeforeSave hashes the code for secure lookups.
-func (c *TablePerUserOAuthCode) BeforeSave(tx *gorm.DB) error {
-	if c.Code != "" {
-		c.CodeHash = encrypt.HashSHA256(c.Code)
-	}
-	return nil
-}
-
-// TableName returns the table name for per-user OAuth authorization codes.
-func (TablePerUserOAuthCode) TableName() string {
-	return "oauth_per_user_codes"
-}
-
-// TablePerUserOAuthPendingFlow stores OAuth parameters between the authorize step
-// and the final code issuance. It carries state through the multi-step consent
-// screen (VK entry + per-MCP upstream auth) before a real authorization code is issued.
-type TablePerUserOAuthPendingFlow struct {
-	ID                string    `gorm:"type:varchar(255);primaryKey" json:"id"`
-	ClientID          string    `gorm:"type:varchar(255);not null;index" json:"client_id"` // Registered OAuth client (from authorize request)
-	RedirectURI       string    `gorm:"type:text;not null" json:"redirect_uri"`            // Client's callback URL
-	CodeChallenge     string    `gorm:"type:varchar(255);not null" json:"-"`               // PKCE S256 challenge (echoed into the final code)
-	State             string    `gorm:"type:text;not null" json:"-"`                       // Original OAuth state (echoed back on final redirect)
-	VirtualKeyID      *string   `gorm:"type:varchar(255);index" json:"virtual_key_id"`     // Set if user chose VK identity
-	UserID            *string   `gorm:"type:varchar(255);index" json:"user_id"`            // Set if user chose User ID identity
-	BrowserSecretHash string    `gorm:"type:varchar(255)" json:"-"`                        // SHA-256 hash of browser-binding cookie secret
-	ExpiresAt         time.Time `gorm:"index;not null" json:"expires_at"`                  // 15-min TTL
-	CreatedAt         time.Time `gorm:"index;not null" json:"created_at"`
-	UpdatedAt         time.Time `gorm:"index;not null" json:"updated_at"`
-}
-
-// TableName returns the table name for per-user OAuth pending flows.
-func (TablePerUserOAuthPendingFlow) TableName() string {
-	return "oauth_per_user_pending_flows"
 }

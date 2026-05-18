@@ -18,8 +18,8 @@ func ResolvePerUserOAuthToken(ctx *schemas.BifrostContext, client *schemas.MCPCl
 		return "", fmt.Errorf("per-user OAuth requires an OAuth2Provider but none is configured")
 	}
 
-	mode := ctx.AuthMode()
-	identity := identityForMode(ctx, mode)
+	mode := ctx.MCPAuthMode()
+	identity := identityForMCPAuthMode(ctx, mode)
 
 	if identity == "" {
 		// No identity column populated for the derived mode. We can neither
@@ -64,24 +64,19 @@ func ResolvePerUserOAuthToken(ctx *schemas.BifrostContext, client *schemas.MCPCl
 }
 
 // identityForMode returns the identity string to look up by, given the derived
-// mode. Mirrors the priority used by ctx.AuthMode(): UserID first, then the
-// legacy X-Bf-User-Id header (BifrostContextKeyMCPUserID), then the resolved
-// VK ID, else the session token.
-func identityForMode(ctx *schemas.BifrostContext, mode schemas.AuthMode) string {
+// mode. Mirrors the priority used by ctx.AuthMode(): UserID for user mode,
+// resolved VK ID for vk mode, session ID for session mode.
+func identityForMCPAuthMode(ctx *schemas.BifrostContext, mode schemas.MCPAuthMode) string {
 	switch mode {
-	case schemas.AuthModeUser:
+	case schemas.MCPAuthModeUser:
 		if v, _ := ctx.Value(schemas.BifrostContextKeyUserID).(string); v != "" {
 			return v
 		}
-		// Legacy X-Bf-User-Id back-compat.
-		if v, _ := ctx.Value(schemas.BifrostContextKeyMCPUserID).(string); v != "" {
-			return v
-		}
-	case schemas.AuthModeVK:
+	case schemas.MCPAuthModeVK:
 		if v, _ := ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID).(string); v != "" {
 			return v
 		}
-	case schemas.AuthModeSession:
+	case schemas.MCPAuthModeSession:
 		if v, _ := ctx.Value(schemas.BifrostContextKeyMCPSessionID).(string); v != "" {
 			return v
 		}

@@ -9,11 +9,13 @@
 // /api/oauth/callback which completes the flow server-side.
 
 import FullPageLoader from "@/components/fullPageLoader";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { getErrorMessage, useGetMCPFlowDetailQuery, useStartMCPFlowMutation } from "@/lib/store";
+import { MCPFlowDetail } from "@/lib/types/mcpSessions";
 import { Link } from "@tanstack/react-router";
-import { ExternalLink, Loader2, ShieldCheck } from "lucide-react";
+import { ExternalLink, Fingerprint, KeyRound, Loader2, ShieldCheck, UserRound } from "lucide-react";
 import { useQueryState } from "nuqs";
 
 export default function MCPSessionsAuthPage() {
@@ -27,8 +29,8 @@ export default function MCPSessionsAuthPage() {
 		return (
 			<CenteredCard>
 				<h1 className="text-xl font-semibold">Missing flow identifier</h1>
-				<p className="mt-2 text-sm text-muted-foreground">
-					This URL is missing the <code className="rounded bg-muted px-1 py-0.5">flow</code> query parameter. Open the link from your
+				<p className="text-muted-foreground mt-2 text-sm">
+					This URL is missing the <code className="bg-muted rounded px-1 py-0.5">flow</code> query parameter. Open the link from your
 					inference response or the sessions tab.
 				</p>
 				<div className="mt-6">
@@ -51,9 +53,9 @@ export default function MCPSessionsAuthPage() {
 			return (
 				<CenteredCard>
 					<h1 className="text-xl font-semibold">This authentication flow isn't yours</h1>
-					<p className="mt-2 text-sm text-muted-foreground">
-						The pending flow belongs to a different identity. Ask the teammate whose VK or user identity triggered the original
-						request to complete it, or trigger a new request yourself.
+					<p className="text-muted-foreground mt-2 text-sm">
+						The pending flow belongs to a different identity. Ask the teammate whose VK or user identity triggered the original request
+						to complete it, or trigger a new request yourself.
 					</p>
 					<div className="mt-6">
 						<SessionsTabLink />
@@ -65,9 +67,9 @@ export default function MCPSessionsAuthPage() {
 			return (
 				<CenteredCard>
 					<h1 className="text-xl font-semibold">This authentication flow has expired or been completed</h1>
-					<p className="mt-2 text-sm text-muted-foreground">
-						Pending flows expire after a short window. If you still need to authenticate, trigger the original action again so a
-						fresh flow is created.
+					<p className="text-muted-foreground mt-2 text-sm">
+						Pending flows expire after a short window. If you still need to authenticate, trigger the original action again so a fresh
+						flow is created.
 					</p>
 					<div className="mt-6">
 						<SessionsTabLink />
@@ -78,7 +80,7 @@ export default function MCPSessionsAuthPage() {
 		return (
 			<CenteredCard>
 				<h1 className="text-xl font-semibold">Could not load this authentication flow</h1>
-				<p className="mt-2 text-sm text-muted-foreground">{getErrorMessage(error)}</p>
+				<p className="text-muted-foreground mt-2 text-sm">{getErrorMessage(error)}</p>
 			</CenteredCard>
 		);
 	}
@@ -87,27 +89,7 @@ export default function MCPSessionsAuthPage() {
 	// or expired. Don't show the "Authenticate" button since startFlow would
 	// reject (BuildUpstreamAuthorizeURL rejects non-pending flows).
 	if (flow.status !== "pending") {
-		return (
-			<CenteredCard>
-				<h1 className="text-xl font-semibold">
-					{flow.status === "authorized"
-						? "Already authenticated"
-						: flow.status === "needs_reauth"
-							? "Re-authentication required"
-							: flow.status === "expired"
-								? "This authentication flow has expired"
-								: "This authentication flow can no longer be completed"}
-				</h1>
-				<p className="mt-2 text-sm text-muted-foreground">
-					{flow.status === "authorized"
-						? `The OAuth credential for ${flow.mcp_client?.name || flow.mcp_client?.client_id || "this MCP server"} is already stored. You can close this tab.`
-						: "Trigger the original action again so a fresh flow is created."}
-				</p>
-				<div className="mt-6">
-					<SessionsTabLink />
-				</div>
-			</CenteredCard>
-		);
+		return <CompletedFlowView flow={flow} />;
 	}
 
 	const handleAuthenticate = async () => {
@@ -119,21 +101,41 @@ export default function MCPSessionsAuthPage() {
 		}
 	};
 
+	const mcpClientName = flow.mcp_client?.name || flow.mcp_client?.client_id || "MCP server";
+	const isReauth = flow.has_active_token === true;
+
 	return (
 		<CenteredCard>
-			<div className="mb-4 flex size-12 items-center justify-center rounded-full bg-primary/10">
-				<ShieldCheck className="size-6 text-primary" />
+			<div className="mb-5 flex size-12 items-center justify-center rounded-full bg-primary/10">
+				<ShieldCheck className="text-primary size-6" />
 			</div>
-			<h1 className="text-xl font-semibold">Authenticate with {flow.mcp_client?.name || flow.mcp_client?.client_id || "MCP server"}</h1>
-			<p className="mt-2 text-sm text-muted-foreground">
-				You'll be redirected to the provider to sign in and grant access. Bifrost will store the resulting credential against your{" "}
-				{flow.flow_mode === "user" ? "user identity" : flow.flow_mode === "vk" ? "virtual key" : "session ID"} so this request and future
-				ones can proceed automatically.
+			<h1 className="text-xl font-semibold tracking-tight">
+				{isReauth ? "Re-authenticate with" : "Authenticate with"} {mcpClientName}
+			</h1>
+			<p className="text-muted-foreground mt-2 text-sm">
+				{isReauth ? (
+					<>
+						An active credential already exists for the binding below. Completing this flow will <strong>replace</strong> it with a fresh
+						credential. You can also close this tab to keep using the existing one.
+					</>
+				) : (
+					<>
+						You'll be redirected to the provider to sign in and grant access. Bifrost stores the resulting credential against the binding
+						below so this request and future ones can proceed automatically.
+					</>
+				)}
 			</p>
+
+			<dl className="bg-muted/40 mt-6 space-y-3 rounded-sm border p-4 text-sm">
+				<DetailRow label="MCP client" value={mcpClientName} mono={!flow.mcp_client?.name} />
+				<DetailRow label="Bound to" value={<BindingValue flow={flow} />} />
+				<DetailRow label="Flow expires" value={formatExpiry(flow.expires_at)} />
+			</dl>
+
 			<div className="mt-6 flex gap-3">
 				<Button onClick={handleAuthenticate} disabled={starting}>
 					{starting ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-					<span className="ml-2">Authenticate</span>
+					<span>{isReauth ? "Re-authenticate" : "Authenticate"}</span>
 				</Button>
 				<SessionsTabLink variant="ghost" />
 			</div>
@@ -141,10 +143,100 @@ export default function MCPSessionsAuthPage() {
 	);
 }
 
+function CompletedFlowView({ flow }: { flow: MCPFlowDetail }) {
+	const mcpClientName = flow.mcp_client?.name || flow.mcp_client?.client_id || "this MCP server";
+	// has_active_token wins over the flow's row status: a pending flow with an
+	// existing active token means OAuth was re-initiated unnecessarily.
+	const effectivelyAuthorized = flow.status === "authorized" || flow.has_active_token;
+	const title = effectivelyAuthorized
+		? "Already authenticated"
+		: flow.status === "needs_reauth"
+			? "Re-authentication required"
+			: flow.status === "expired"
+				? "This authentication flow has expired"
+				: "This authentication flow can no longer be completed";
+	const body = effectivelyAuthorized
+		? `The OAuth credential for ${mcpClientName} is already stored. You can close this tab.`
+		: "Trigger the original action again so a fresh flow is created.";
+	return (
+		<CenteredCard>
+			<h1 className="text-xl font-semibold tracking-tight">{title}</h1>
+			<p className="text-muted-foreground mt-2 text-sm">{body}</p>
+			<dl className="bg-muted/40 mt-6 space-y-3 rounded-sm border p-4 text-sm">
+				<DetailRow label="MCP client" value={mcpClientName} mono={!flow.mcp_client?.name} />
+				<DetailRow label="Bound to" value={<BindingValue flow={flow} />} />
+			</dl>
+			<div className="mt-6">
+				<SessionsTabLink />
+			</div>
+		</CenteredCard>
+	);
+}
+
+function DetailRow({ label, value, mono = false }: { label: string; value: React.ReactNode; mono?: boolean }) {
+	return (
+		<div className="flex items-start justify-between gap-4">
+			<dt className="text-muted-foreground text-xs font-medium tracking-wide uppercase">{label}</dt>
+			<dd className={`text-right text-sm ${mono ? "font-mono" : ""}`}>{value}</dd>
+		</div>
+	);
+}
+
+function BindingValue({ flow }: { flow: MCPFlowDetail }) {
+	if (flow.flow_mode === "user") {
+		const userID = flow.user_id;
+		if (!userID) {
+			return (
+				<span className="inline-flex items-center gap-2">
+					<UserRound className="text-muted-foreground size-3.5" />
+					<Badge variant="secondary">First signed-in user</Badge>
+				</span>
+			);
+		}
+		return (
+			<span className="inline-flex items-center gap-2">
+				<UserRound className="text-muted-foreground size-3.5" />
+				<span className="font-mono">{userID}</span>
+			</span>
+		);
+	}
+	if (flow.flow_mode === "vk" && flow.virtual_key) {
+		return (
+			<span className="inline-flex items-center gap-2">
+				<KeyRound className="text-muted-foreground size-3.5" />
+				<span>{flow.virtual_key.name || flow.virtual_key.id}</span>
+			</span>
+		);
+	}
+	if (flow.flow_mode === "session" && flow.session_id) {
+		return (
+			<span className="inline-flex items-center gap-2">
+				<Fingerprint className="text-muted-foreground size-3.5" />
+				<span className="font-mono">{flow.session_id}</span>
+			</span>
+		);
+	}
+	return <span className="text-muted-foreground italic">Unknown</span>;
+}
+
+function formatExpiry(iso: string): string {
+	try {
+		const d = new Date(iso);
+		const diffMs = d.getTime() - Date.now();
+		if (diffMs < 0) return "Expired";
+		const mins = Math.floor(diffMs / 60_000);
+		if (mins < 1) return "in less than a minute";
+		if (mins === 1) return "in 1 minute";
+		return `in ${mins} minutes`;
+	} catch {
+		return iso;
+	}
+}
+
 function CenteredCard({ children }: { children: React.ReactNode }) {
 	return (
 		<div className="mx-auto flex min-h-[60vh] w-full max-w-xl items-center justify-center p-6">
-			<div className="w-full rounded-lg border bg-card p-8 shadow-sm">{children}</div>
+			<div className="bg-card w-full rounded-sm border p-8 shadow-sm">{children}</div>
 		</div>
 	);
 }
@@ -169,8 +261,8 @@ function UnauthenticatedView({ flowId }: { flowId: string }) {
 	const loginURL = `/login?goto=${encodeURIComponent(goto)}`;
 	return (
 		<CenteredCard>
-			<h1 className="text-xl font-semibold">Sign in to complete authentication</h1>
-			<p className="mt-2 text-sm text-muted-foreground">
+			<h1 className="text-xl font-semibold tracking-tight">Sign in to complete authentication</h1>
+			<p className="text-muted-foreground mt-2 text-sm">
 				Bifrost needs to know who you are before linking this OAuth credential. You'll be sent back here after signing in.
 			</p>
 			<div className="mt-6">
